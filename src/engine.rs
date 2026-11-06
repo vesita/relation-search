@@ -27,6 +27,14 @@ const CONTENT_FIELD: &str = "content";
 /// 建索引时 writer 的内存预算（字节）。
 const WRITER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
+/// 同一文件在一个结果集里最多保留的块数（防止单个大文件把候选位占满）。
+const PER_FILE_CAP: usize = 2;
+
+/// 检索时先多取一些候选，再做「文件类型权重 + 每文件上限」重排的池大小系数/上下限。
+const POOL_FACTOR: usize = 6;
+const POOL_MIN: usize = 40;
+const POOL_MAX: usize = 200;
+
 /// schema：path/start_line/end_line/content 四个字段。
 /// content 用自定义 "code" 分词器，且要 WithFreqsAndPositions（BM25 需要词频）。
 pub fn build_schema() -> Schema {
@@ -150,6 +158,8 @@ pub struct Candidate {
     pub score: f64,
     pub snippet: String,
     pub source: String, // "bm25" 或 "ast"
+    pub kind: String,   // "code" | "test" | "doc" | "config" | "other"
+    pub symbol: String, // 所在一处定义的签名（尽力而为，可能为空）
 }
 
 /// search 命令的 stdout JSON 结构。
@@ -190,13 +200,16 @@ pub fn search_root(
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let query_ast = build_query(content_f, query);
+    // 先按 BM25 多取一些（池），再做「文件类型权重 + 每文件上限」重排：
+    // 让实现代码压过近义的文档/配置，也不让单个大文件把候选位占满。
+    let pool = limit.saturating_mul(POOL_FACTOR).clamp(POOL_MIN, POOL_MAX);
     let top = searcher.search(
         query_ast.as_ref(),
-        &TopDocs::with_limit(limit).order_by_score(),
+        &TopDocs::with_limit(pool).order_by_score(),
     )?;
 
-    let mut candidates = Vec::with_capacity(top.len());
-    for (score, addr) in top {
+    let mut candidates: Vec<Candidate> = Vec::with_capacity(top.len());
+    for (raw_score, addr) in top {
         let doc: TantivyDocument = searcher.doc(addr)?;
         let path = doc
             .get_first(path_f)
@@ -209,15 +222,21 @@ pub fn search_root(
             .get_first(content_f)
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let kind = classify_kind(&path);
         candidates.push(Candidate {
+            score: f64::from(raw_score) * kind_weight(kind),
+            kind: kind.to_string(),
+            symbol: extract_symbol(content),
             path,
             start_line,
             end_line,
-            score: f64::from(score),
             snippet: make_snippet(content, query),
             source: "bm25".to_string(),
         });
     }
+    // 权重已并入 score；按 score 降序、每文件最多 PER_FILE_CAP 块，取前 limit。
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut candidates = cap_per_file(candidates, PER_FILE_CAP, limit);
 
     if let Some(pattern) = ast_pattern {
         candidates.extend(ast_candidates(&root_abs, pattern, limit));
@@ -307,6 +326,8 @@ fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate
                 break;
             }
             out.push(Candidate {
+                kind: classify_kind(&rel).to_string(),
+                symbol: extract_symbol(&m.text()),
                 path: rel.clone(),
                 start_line: m.start_pos().line() as u64 + 1,
                 end_line: m.end_pos().line() as u64 + 1,
@@ -390,9 +411,229 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// 判断文件类型：代码 / 测试 / 文档 / 配置 / 其它。
+/// 目的：检索默认「代码优先」——文档与配置在实现检索里是噪声，应排在代码之后。
+fn classify_kind(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let is_code = matches!(
+        ext,
+        "rs" | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "py"
+            | "go"
+            | "java"
+            | "kt"
+            | "kts"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "hpp"
+            | "hh"
+            | "cs"
+            | "rb"
+            | "php"
+            | "swift"
+            | "m"
+            | "mm"
+            | "scala"
+            | "lua"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "sql"
+            | "r"
+            | "jl"
+            | "dart"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "hs"
+            | "clj"
+            | "vue"
+            | "svelte"
+            | "astro"
+    );
+    if is_code {
+        let in_tests = lower.contains("/tests/")
+            || lower.starts_with("tests/")
+            || lower.contains("/test/")
+            || lower.contains("/__tests__/");
+        let name_test = file.contains("_test.")
+            || file.starts_with("test_")
+            || file.contains(".test.")
+            || file.contains(".spec.");
+        return if in_tests || name_test {
+            "test"
+        } else {
+            "code"
+        };
+    }
+    match ext {
+        "md" | "markdown" | "mdx" | "rst" | "txt" | "adoc" => "doc",
+        "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf" | "lock" | "env"
+        | "properties" => "config",
+        _ => "other",
+    }
+}
+
+/// 文件类型对最终排序的权重：实现代码满分；文档/配置显著降权（仍可被召回，只是排在后面）。
+fn kind_weight(kind: &str) -> f64 {
+    match kind {
+        "code" => 1.0,
+        "test" => 0.85,
+        "doc" => 0.30,
+        "config" => 0.35,
+        _ => 0.60,
+    }
+}
+
+/// 按「每文件最多 per_file 块」过滤并截断到 limit 条；在已按 score 排序的前提下使用。
+fn cap_per_file(items: Vec<Candidate>, per_file: usize, limit: usize) -> Vec<Candidate> {
+    let mut per: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(limit.min(items.len()));
+    for item in items {
+        if out.len() >= limit {
+            break;
+        }
+        let seen = per.entry(item.path.clone()).or_insert(0);
+        if *seen < per_file {
+            *seen += 1;
+            out.push(item);
+        }
+    }
+    out
+}
+
+/// 尽力从块内容里取「所在定义」的签名（`fn foo` / `struct Bar` / `class Baz` …），取不到返回空串。
+/// 只做启发式：扫块内首个看起来像定义的行（切块按空行分段，块通常以定义起始）。
+fn extract_symbol(content: &str) -> String {
+    const KWS: &[&str] = &[
+        "fn",
+        "func",
+        "def",
+        "class",
+        "struct",
+        "enum",
+        "trait",
+        "interface",
+        "impl",
+        "type",
+        "module",
+        "object",
+    ];
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("/*")
+            || line.starts_with('*')
+        {
+            continue;
+        }
+        for kw in KWS {
+            if let Some(pos) = find_word(line, kw) {
+                let name: String = line[pos + kw.len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                let name = name.trim_matches(':');
+                if !name.is_empty() {
+                    return format!("{kw} {name}");
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// 在 line 里查找独立出现的词 kw（左右边界都不是标识符字符），返回字节位置。
+fn find_word(line: &str, kw: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = line[from..].find(kw) {
+        let pos = from + rel;
+        let before_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+        let after = pos + kw.len();
+        let after_ok = after >= bytes.len() || !is_ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            return Some(pos);
+        }
+        from = pos + kw.len();
+    }
+    None
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cand(path: &str, score: f64) -> Candidate {
+        Candidate {
+            path: path.to_string(),
+            start_line: 1,
+            end_line: 2,
+            score,
+            snippet: String::new(),
+            source: "bm25".to_string(),
+            kind: "code".to_string(),
+            symbol: String::new(),
+        }
+    }
+
+    #[test]
+    fn classifies_kinds() {
+        assert_eq!(classify_kind("src/engine.rs"), "code");
+        assert_eq!(classify_kind("crates/x/tests/pg.rs"), "test");
+        assert_eq!(classify_kind("tests/smoke.rs"), "test");
+        assert_eq!(classify_kind("src/foo_test.rs"), "test");
+        assert_eq!(classify_kind("docs/BACKLOG.md"), "doc");
+        assert_eq!(classify_kind("Cargo.toml"), "config");
+        assert_eq!(classify_kind("README.md"), "doc");
+    }
+
+    #[test]
+    fn extracts_symbols() {
+        assert_eq!(
+            extract_symbol("pub fn user_profile_cache(x: u64) -> u64 {\n  x\n}"),
+            "fn user_profile_cache"
+        );
+        assert_eq!(
+            extract_symbol("// comment\npub struct UserProfileCache2 {}"),
+            "struct UserProfileCache2"
+        );
+        assert_eq!(
+            extract_symbol("def load_user_profile(user_id):\n    ..."),
+            "def load_user_profile"
+        );
+        assert_eq!(extract_symbol("hello world"), "");
+    }
+
+    #[test]
+    fn cap_per_file_limits_per_file() {
+        let items = vec![
+            cand("a.rs", 9.0),
+            cand("a.rs", 8.0),
+            cand("a.rs", 7.0),
+            cand("b.rs", 6.0),
+        ];
+        let out = cap_per_file(items, 2, 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.iter().filter(|c| c.path == "a.rs").count(), 2);
+    }
 
     #[test]
     fn snippet_centers_on_token() {

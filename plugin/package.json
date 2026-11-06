@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-search",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "DeepSeek Harness plugin: code retrieval tool code_search (tantivy BM25 + jieba + embedded ast-grep) so the agent searches existing code before writing new implementations",
   "license": "MIT",
   "repository": {

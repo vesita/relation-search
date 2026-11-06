@@ -80,8 +80,11 @@ function renderText(args: any, value: any): string {
   const candidates: any[] = Array.isArray(value?.candidates) ? value.candidates : []
   candidates.forEach((c, index) => {
     const score = typeof c?.score === 'number' ? c.score.toFixed(2) : String(c?.score ?? '')
+    const kind = String(c?.kind ?? '')
+    const symbol = String(c?.symbol ?? '')
+    const meta = [kind, symbol, `score ${score}`, String(c?.source)].filter(Boolean)
     lines.push('')
-    lines.push(`[${index + 1}] ${String(c?.path)}:${String(c?.startLine)}-${String(c?.endLine)}  (score ${score} · ${String(c?.source)})`)
+    lines.push(`[${index + 1}] ${String(c?.path)}:${String(c?.startLine)}-${String(c?.endLine)}  (${meta.join(' · ')})`)
     lines.push('```')
     lines.push(String(c?.snippet ?? ''))
     lines.push('```')
@@ -98,7 +101,7 @@ export function apply(ctx: any): void {
   const codeReuseSearchTool = defineTool({
     name: 'code_search',
     description:
-      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 全文 + 代码分词 + 可选 ast-grep 结构匹配）。返回候选的文件:行、代码片段与命中来源，用于判断能否复用旧实现、避免重复造轮子。',
+      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 全文 + 代码分词 + 可选 ast-grep 结构匹配）。默认代码优先（文档/配置降权、每文件最多 2 块），返回候选的文件:行、代码片段、文件类型 kind 与所在 symbol、命中来源，用于判断能否复用旧实现、避免重复造轮子。',
     parameters: {
       query: {
         type: 'string',
@@ -138,6 +141,8 @@ export function apply(ctx: any): void {
                 score: { type: 'number', required: true },
                 source: { type: 'string', required: true },
                 snippet: { type: 'string', required: true },
+                kind: { type: 'string', required: true },
+                symbol: { type: 'string', required: true },
               },
             },
           },

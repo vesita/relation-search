@@ -19,10 +19,12 @@ code-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n>] [
 - `search` 成功向 stdout 打印 JSON：
   ```json
   {"query":"...","root":"...","count":2,"candidates":[
-    {"path":"rel/file.rs","startLine":10,"endLine":28,"score":12.3,"snippet":"...","source":"bm25"}
+    {"path":"rel/file.rs","startLine":10,"endLine":28,"score":12.3,"snippet":"...","source":"bm25","kind":"code","symbol":"fn user_profile_cache"}
   ]}
   ```
   `source` 取 `bm25` 或 `ast`；无命中时 `count:0,"candidates":[]`，退出码 0。
+  `kind` 取 `code` / `test` / `doc` / `config` / `other`；`symbol` 是块内首个定义签名（`fn foo` / `struct Bar` …，尽力而为，取不到为空串）。
+- `search` 默认**代码优先**：先按 BM25 多取候选，再按文件类型加权（`code` 1.0 / `test` 0.85 / `doc` 0.30 / `config` 0.35 / 其它 0.60）重排，并对**同一文件最多保留 2 块**——避免文档/配置或单个大文件把候选位占满。返回的 `score` 是加权后的最终排序分。
 - `--query` 与建索引共用同一个代码分词器（camelCase / snake_case / CJK 切词）：切出的词项按 OR 召回、BM25 排序；词项整串相邻出现时（如完整标识符 `user_profile_cache`）再加一条短语子句加分，把精确命中排到更前。`:`、`(`、`[`、引号、开头的 `-` 等标点/符号**不当作查询语法**，`IndexWriter::commit`、`fn(x)`、`matches!(x, Some(_))`、`-verbose` 这类代码片段可直接搜、不会因语法错误整条失败。
 - `--ast-pattern <p>` 的 ast-grep 结构召回**已编入二进制**（`ast-grep-core` + `ast-grep-language`，tree-sitter 语法随包），无需另装 `sg`/`ast-grep`。
 - 出错向 stderr 打印原因、退出码非 0。
