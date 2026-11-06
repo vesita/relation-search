@@ -23,6 +23,7 @@ code-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n>] [
   ]}
   ```
   `source` 取 `bm25` 或 `ast`；无命中时 `count:0,"candidates":[]`，退出码 0。
+- `--query` 与建索引共用同一个代码分词器（camelCase / snake_case / CJK 切词）：切出的词项按 OR 召回、BM25 排序；词项整串相邻出现时（如完整标识符 `user_profile_cache`）再加一条短语子句加分，把精确命中排到更前。`:`、`(`、`[`、引号、开头的 `-` 等标点/符号**不当作查询语法**，`IndexWriter::commit`、`fn(x)`、`matches!(x, Some(_))`、`-verbose` 这类代码片段可直接搜、不会因语法错误整条失败。
 - `--ast-pattern <p>` 的 ast-grep 结构召回**已编入二进制**（`ast-grep-core` + `ast-grep-language`，tree-sitter 语法随包），无需另装 `sg`/`ast-grep`。
 - 出错向 stderr 打印原因、退出码非 0。
 - 默认索引目录：`${CODE_SEARCH_CACHE_DIR:-$HOME/.cache/code-search}/<对 root 稳定哈希>`。
@@ -35,3 +36,7 @@ cd plugin && pnpm install && pnpm build
 ```
 
 （本仓文档与注释跟随代码；插件安装见 `plugin/README.md`。）
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。

@@ -37,14 +37,14 @@ enum Command {
         /// 自定义索引目录（默认与 index 相同）
         #[arg(long)]
         index_dir: Option<PathBuf>,
-        /// 查询串
-        #[arg(long)]
+        /// 查询串（允许以 `-` 开头，如搜索 `-verbose` 这类代码片段）
+        #[arg(long, allow_hyphen_values = true)]
         query: String,
         /// 返回条数上限（默认 8）
         #[arg(long, default_value_t = 8)]
         limit: usize,
-        /// ast-grep 结构模式（需 PATH 中有 sg / ast-grep，否则静默跳过）
-        #[arg(long)]
+        /// ast-grep 结构模式（已编入二进制，无需 PATH 中的 sg / ast-grep）
+        #[arg(long, allow_hyphen_values = true)]
         ast_pattern: Option<String>,
     },
 }

@@ -1,8 +1,9 @@
 [package]
 name = "code-search"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "代码检索：tantivy BM25 + 代码感知分词 + 内嵌 ast-grep 结构召回（无需外部工具）"
+repository = "https://github.com/vesita/code-search"
 
 [[bin]]
 name = "code-search"

@@ -165,3 +165,101 @@ fn end_to_end_index_and_search() {
     let _ = std::fs::remove_dir_all(&index_dir);
     let _ = std::fs::remove_dir_all(&auto_index);
 }
+
+/// 回归：代码片段式查询（含 `:: () [] : " /regex/` 等）以前会被 tantivy QueryParser
+/// 当成查询语法，导致整个 search 退出码 1；应改为分词后按词项 OR 召回、始终成功。
+#[test]
+fn code_like_queries_do_not_error_and_still_match() {
+    let fixture = unique_tmp("punct");
+    let index_dir = unique_tmp("punct-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    write(
+        &fixture.join("src/engine.rs"),
+        "pub struct IndexWriter;\nimpl IndexWriter {\n    pub fn commit(&mut self) {}\n}\nfn check(x: Option<u8>) -> bool {\n    matches!(x, Some(_))\n}\n",
+    );
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    // 以前这些都会 "error: Syntax Error / Field does not exist / Unsupported query"。
+    let queries = [
+        "IndexWriter::commit",
+        "fn(check)",
+        "matches!(x, Some(_))",
+        "user:foo",
+        "\"unbalanced",
+        "[index]",
+        "/regex/",
+        "index-writing",
+        "-verbose",
+        "--foo",
+    ];
+    for q in queries {
+        let (code, stdout, stderr) =
+            run(&["search", "--root", &fs, "--index-dir", &is, "--query", q]);
+        assert_eq!(code, 0, "查询应成功而非报错: {q:?}, stderr={stderr}");
+        let j = parse_single_json(&stdout);
+        assert!(j["count"].is_number(), "应有 count 字段: {q:?}");
+    }
+
+    // 代码片段应真正命中（查询分词与索引分词对齐）。
+    let (code, stdout, _) = run(&[
+        "search",
+        "--root",
+        &fs,
+        "--index-dir",
+        &is,
+        "--query",
+        "matches!(x, Some(_))",
+    ]);
+    assert_eq!(code, 0);
+    let j = parse_single_json(&stdout);
+    assert!(
+        j["count"].as_u64().unwrap() > 0,
+        "matches! 查询应命中 src/engine.rs，实际 count=0"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// 回归：ast-grep 模式按语言缓存后，结构召回仍应命中。
+#[test]
+fn ast_pattern_still_matches() {
+    let fixture = unique_tmp("ast");
+    let index_dir = unique_tmp("ast-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    write(
+        &fixture.join("src/lib.rs"),
+        "fn alpha() {\n    let x = 1;\n}\n\nfn beta() {\n    let y = 2;\n}\n",
+    );
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    let (code, stdout, stderr) = run(&[
+        "search",
+        "--root",
+        &fs,
+        "--index-dir",
+        &is,
+        "--query",
+        "zzz_nomatch",
+        "--ast-pattern",
+        "fn $F($$$) { $$$ }",
+    ]);
+    assert_eq!(code, 0, "ast 检索失败: {stderr}");
+    let j = parse_single_json(&stdout);
+    let cands = j["candidates"].as_array().unwrap();
+    assert!(
+        cands
+            .iter()
+            .any(|c| c["source"] == "ast" && c["path"].as_str().unwrap_or("").ends_with("lib.rs")),
+        "ast 结构召回应命中 lib.rs"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}

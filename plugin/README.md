@@ -18,7 +18,7 @@ pnpm install
 pnpm pack
 
 # 3) 装进 profile（把 <profile> 换成正在用的，如 web）
-dsh plugin --profile <profile> add "file:$PWD/dsh-code-search-0.1.0.tgz"
+dsh plugin --profile <profile> add "file:$PWD/dsh-code-search-0.2.1.tgz"
 # 重启 dsh 后该 profile 的 agent 即可调用 code_search
 ```
 

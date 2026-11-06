@@ -1,15 +1,15 @@
 //! 引擎：schema、建索引、BM25 检索、snippet、可选 ast-grep 结构召回、输出结构。
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, STORED, STRING,
+    Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, Value, FAST, STORED,
+    STRING,
 };
 use tantivy::{doc, Index, IndexWriter, TantivyDocument};
 
@@ -57,7 +57,8 @@ fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field)> {
 }
 
 /// 默认索引目录：`${CODE_SEARCH_CACHE_DIR:-$HOME/.cache/code-search}/<canonical root 的稳定哈希>`。
-/// 用 DefaultHasher 十六进制；同一 root 每次得到同一目录。
+/// 哈希必须跨进程、跨 Rust 版本稳定（缓存目录语义）：`DefaultHasher` 的文档明确不保证这一点，
+/// 一旦算法随版本变化，旧缓存就会变成永远命中不了的孤儿目录，所以这里用固定常量的 FNV-1a。
 pub fn default_index_dir(root: &Path) -> Result<PathBuf> {
     let canonical = root
         .canonicalize()
@@ -65,14 +66,24 @@ pub fn default_index_dir(root: &Path) -> Result<PathBuf> {
     let cache = match std::env::var_os("CODE_SEARCH_CACHE_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
-            let home = std::env::var_os("HOME")
-                .context("HOME 环境变量未设置，无法确定默认缓存目录（可设 CODE_SEARCH_CACHE_DIR 覆盖）")?;
+            let home = std::env::var_os("HOME").context(
+                "HOME 环境变量未设置，无法确定默认缓存目录（可设 CODE_SEARCH_CACHE_DIR 覆盖）",
+            )?;
             PathBuf::from(home).join(".cache").join("code-search")
         }
     };
-    let mut hasher = DefaultHasher::new();
-    canonical.to_string_lossy().hash(&mut hasher);
-    Ok(cache.join(format!("{:x}", hasher.finish())))
+    let hash = fnv1a64(canonical.to_string_lossy().as_bytes());
+    Ok(cache.join(format!("{hash:x}")))
+}
+
+/// 64 位 FNV-1a：常量固定，因此同一输入在任何 Rust 版本/平台上都得到同一哈希。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 /// index 命令的摘要。
@@ -178,9 +189,11 @@ pub fn search_root(
     let (path_f, start_f, end_f, content_f) = field_ids(&index.schema())?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let parser = QueryParser::for_index(&index, vec![content_f]);
-    let parsed = parser.parse_query(query)?;
-    let top = searcher.search(&parsed, &TopDocs::with_limit(limit).order_by_score())?;
+    let query_ast = build_query(content_f, query);
+    let top = searcher.search(
+        query_ast.as_ref(),
+        &TopDocs::with_limit(limit).order_by_score(),
+    )?;
 
     let mut candidates = Vec::with_capacity(top.len());
     for (score, addr) in top {
@@ -218,6 +231,46 @@ pub fn search_root(
     })
 }
 
+/// 把查询串构成 BM25 查询。
+///
+/// 关键：**不走 tantivy 的 `QueryParser`**。用户给的多半是代码片段（`IndexWriter::commit`、
+/// `fn(user_id)`、`foo[0]`、`"xxx`），`QueryParser` 会把 `:`/`[`/`(`/引号当成查询语法而直接
+/// 报语法错（整个 search 退出码非 0），也会把 `-`/`|`/`.` 拆成的多段强绑成「相邻短语」
+/// （`index-writing` 反而搜不到）。这里复用建索引时的同一个 `CodeTokenizer` 把查询切成词项：
+/// - 每个词项一条 `TermQuery`（`Should`/OR）：任一命中即可召回，标点不再是语法；
+/// - 词项多于一个时再加一条整串 `PhraseQuery`（`Should`）：词项**相邻**出现（如完整标识符
+///   `user_profile_cache`）时额外贡献 BM25 分，把「精确命中该符号」的块排到更前。
+///
+/// 于是既保住代码片段的召回，又保住标识符检索的排序精度。空查询返回匹配空集。
+fn build_query(content_f: Field, query: &str) -> Box<dyn Query> {
+    let raw = tokenize_to_strings(query);
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut terms: Vec<Term> = Vec::with_capacity(raw.len());
+    for token in &raw {
+        if token.is_empty() || !seen.insert(token.as_str()) {
+            continue;
+        }
+        terms.push(Term::from_field_text(content_f, token));
+    }
+    if terms.is_empty() {
+        return Box::new(EmptyQuery);
+    }
+    // WithFreqs：BM25 需要词频打分；content 字段本就用 WithFreqsAndPositions 建索引。
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = terms
+        .iter()
+        .map(|t| {
+            (
+                Occur::Should,
+                Box::new(TermQuery::new(t.clone(), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
+            )
+        })
+        .collect();
+    if terms.len() > 1 {
+        clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
+    }
+    Box::new(BooleanQuery::new(clauses))
+}
+
 /// 用内嵌 ast-grep（tree-sitter 语法已编入二进制）做结构搜索，无需外部 `sg`。
 /// 按文件扩展名判定语言；该语言不支持或 pattern 解析失败的文件跳过。
 fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate> {
@@ -226,6 +279,10 @@ fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate
         Ok(r) => r,
         Err(_) => return out,
     };
+    // Pattern::try_new 会把源码解析成 AST 模式树，有实打实的解析成本；旧写法在「每个文件」
+    // 里都重新编译一次（N 个文件 = N 次编译）。这里按语言缓存：同一语言只编译一次，
+    // 编译失败也缓存 None（该语言下所有文件都跳过）。
+    let mut patterns: HashMap<SupportLang, Option<Pattern>> = HashMap::new();
     let _ = for_each_text_file(&root, |path, content| {
         if out.len() >= limit {
             return Ok(());
@@ -233,9 +290,11 @@ fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate
         let Some(lang) = SupportLang::from_path(path) else {
             return Ok(());
         };
-        let pattern = match Pattern::try_new(pattern_src, lang) {
-            Ok(p) => p,
-            Err(_) => return Ok(()),
+        let pattern = patterns
+            .entry(lang)
+            .or_insert_with(|| Pattern::try_new(pattern_src, lang).ok());
+        let Some(pattern) = pattern.as_ref() else {
+            return Ok(());
         };
         let source = lang.ast_grep(content);
         let root_node = source.root();
@@ -261,15 +320,34 @@ fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate
     out
 }
 
-/// snippet：围绕 query 首个 token 的位置截 ~240 字符，找不到就取前 240 字符。
+/// snippet：在所有查询词项的出现位置里，选一个「覆盖最多不同词项」的 ~240 字节窗口；
+/// 只按首个 token 定位会漏掉「多个词分散出现」的块。一个都没找到就取前 240 字符。
 fn make_snippet(content: &str, query: &str) -> String {
-    let tokens = tokenize_to_strings(query);
-    if let Some(first) = tokens.first() {
-        if let Some(pos) = find_ci(content, first) {
-            return window_around(content, pos, 240, 80);
+    let mut seen: HashSet<String> = HashSet::new();
+    let tokens: Vec<String> = tokenize_to_strings(query)
+        .into_iter()
+        .filter(|t| !t.is_empty() && seen.insert(t.clone()))
+        .collect();
+    if tokens.is_empty() {
+        return truncate_chars(content, 240);
+    }
+    let mut best: Option<(usize, String)> = None;
+    for token in &tokens {
+        let Some(pos) = find_ci(content, token) else {
+            continue;
+        };
+        let window = window_around(content, pos, 240, 80);
+        let window_lower = window.to_lowercase();
+        let distinct = tokens
+            .iter()
+            .filter(|t| window_lower.contains(&t.to_lowercase()))
+            .count();
+        if best.as_ref().is_none_or(|(b, _)| distinct > *b) {
+            best = Some((distinct, window));
         }
     }
-    truncate_chars(content, 240)
+    best.map(|(_, w)| w)
+        .unwrap_or_else(|| truncate_chars(content, 240))
 }
 
 /// 大小写不敏感查找，返回在 hay 里的字节位置。
@@ -328,5 +406,27 @@ mod tests {
     fn snippet_falls_back_to_head() {
         let content = "hello world";
         assert_eq!(make_snippet(content, "zzz"), "hello world");
+    }
+
+    #[test]
+    fn snippet_prefers_window_covering_more_tokens() {
+        // 首词后隔了很远才出现后两个词：只按首词定位的窗口只能覆盖 1 个词，
+        // 应改为选中覆盖 2 个词的尾部窗口。
+        let filler = "x".repeat(400);
+        let content = format!("alpha {filler} beta gamma");
+        let snip = make_snippet(&content, "alpha beta gamma");
+        assert!(
+            snip.contains("beta") && snip.contains("gamma"),
+            "snippet={snip}"
+        );
+        assert!(snip.chars().count() <= 240);
+    }
+
+    #[test]
+    fn fnv1a64_matches_known_vectors() {
+        // 锁定常量：换实现导致索引目录哈希漂移时这条会变红。
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"hello"), 0xa430_d846_80aa_bd0b);
     }
 }

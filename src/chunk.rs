@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn splits_on_blank_lines_and_merges() {
         let content = "fn a() {}\n\nfn b() {}\n";
-        let chunks = chunk_text("x.rs", &content);
+        let chunks = chunk_text("x.rs", content);
         // 两段都小，会被合并成一块。
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].start_line, 1);
