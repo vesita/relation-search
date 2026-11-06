@@ -224,6 +224,64 @@ fn code_like_queries_do_not_error_and_still_match() {
     let _ = std::fs::remove_dir_all(&index_dir);
 }
 
+/// 增量索引：同一个 index-dir 重复 index 时，应正确处理「未变 / 修改 / 新增 / 删除」，
+/// 保证索引与当前源码一致，而不是依赖整目录重建。
+#[test]
+fn incremental_index_reflects_changes() {
+    let fixture = unique_tmp("inc-fixture");
+    let index_dir = unique_tmp("inc-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    let a = fixture.join("a.rs");
+    let b = fixture.join("b.rs");
+    // 三个互不共享词项的标识符（无 camel 边界，整体一个 token），便于精确判断命中变化。
+    write(&a, "fn aardvarktoken() {}\n");
+
+    let index_docs = |expect: u64| {
+        let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+        assert_eq!(code, 0, "index 失败: {stderr}");
+        let j = parse_single_json(&stdout);
+        assert_eq!(
+            j["documents"],
+            Value::from(expect),
+            "documents 不符: stdout={stdout}"
+        );
+    };
+    let count_for = |q: &str| -> u64 {
+        let (code, stdout, _) = run(&["search", "--root", &fs, "--index-dir", &is, "--query", q]);
+        assert_eq!(code, 0);
+        parse_single_json(&stdout)["count"].as_u64().unwrap()
+    };
+
+    // 首次：1 个块。
+    index_docs(1);
+    assert!(count_for("aardvarktoken") > 0, "初始应命中 a.rs");
+
+    // 修改 a.rs 内容：重跑应替换旧块（旧词消失、新词命中），docs 仍为 1。
+    write(&a, "fn buffalotoken() {}\n");
+    index_docs(1);
+    assert_eq!(count_for("aardvarktoken"), 0, "修改后旧词应不再命中");
+    assert!(count_for("buffalotoken") > 0, "修改后新词应命中");
+
+    // 新增 b.rs：docs 变 2。
+    write(&b, "fn cheetahtoken() {}\n");
+    index_docs(2);
+    assert!(count_for("cheetahtoken") > 0, "新增文件应命中");
+
+    // 未变再跑：docs 仍 2。
+    index_docs(2);
+
+    // 删除 b.rs：docs 回 1，其词不再命中。
+    std::fs::remove_file(&b).unwrap();
+    index_docs(1);
+    assert_eq!(count_for("cheetahtoken"), 0, "删除文件应不再命中");
+    assert!(count_for("buffalotoken") > 0, "保留文件应仍命中");
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
 /// 回归：ast-grep 模式按语言缓存后，结构召回仍应命中。
 #[test]
 fn ast_pattern_still_matches() {
@@ -258,6 +316,12 @@ fn ast_pattern_still_matches() {
             .iter()
             .any(|c| c["source"] == "ast" && c["path"].as_str().unwrap_or("").ends_with("lib.rs")),
         "ast 结构召回应命中 lib.rs"
+    );
+    // 融合后不应超过 limit（默认 8），也不会把 AST 结果无脑追加到 limit 之外。
+    assert!(
+        cands.len() <= 8,
+        "结果数不应超过 limit，实际 {}",
+        cands.len()
     );
 
     let _ = std::fs::remove_dir_all(&fixture);

@@ -1,6 +1,6 @@
 {
   "name": "dsh-relation-search",
-  "version": "0.2.5",
+  "version": "0.2.10",
   "description": "DeepSeek Harness plugin: code retrieval tool relation_search (tantivy BM25 + jieba + embedded ast-grep) so the agent searches existing code before writing new implementations",
   "license": "MIT",
   "repository": {
@@ -22,6 +22,9 @@
     "bin/relation-search",
     "README.md"
   ],
+  "bin": {
+    "relation-search": "./bin/relation-search"
+  },
   "scripts": {
     "build": "rm -rf lib && tsc -p tsconfig.json",
     "prepack": "pnpm run build",

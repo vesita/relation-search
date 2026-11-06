@@ -5,25 +5,31 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
+use tantivy::merge_policy::LogMergePolicy;
 use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
-    FAST, Field, IndexRecordOption, STORED, STRING, Schema, Term, TextFieldIndexing, TextOptions,
-    Value,
+    FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, Term, TextFieldIndexing,
+    TextOptions, Value,
 };
-use tantivy::{Index, IndexWriter, TantivyDocument, doc};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument, doc};
 
 use ast_grep_core::Pattern;
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 
-use crate::chunk::{for_each_chunk, for_each_text_file};
-use crate::tokenizer::{CodeTokenizer, TOKENIZER_NAME, tokenize_to_strings};
+use crate::chunk::{chunk_text, for_each_text_file};
+use crate::tokenizer::{TOKENIZER_NAME, build_analyzer, tokenize_to_strings};
 
 const PATH_FIELD: &str = "path";
 const START_FIELD: &str = "start_line";
 const END_FIELD: &str = "end_line";
 const CONTENT_FIELD: &str = "content";
+/// 文件类型编号（code/test/doc/config/generated/other → 0..5），用于查询期 kind 过滤与打分加权。
+const KIND_ID_FIELD: &str = "kind_id";
+/// 文件相对路径（`STRING` 原样索引、不存储）：增量更新时按 file 精确 `delete_term` 删掉该文件旧块。
+const FILE_FIELD: &str = "file";
 
 /// 建索引时 writer 的内存预算（字节）。
 const WRITER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
@@ -36,13 +42,23 @@ const POOL_FACTOR: usize = 6;
 const POOL_MIN: usize = 40;
 const POOL_MAX: usize = 200;
 
+/// 索引格式版本：schema / 分词器语义发生不兼容变化时 +1。
+/// 它参与默认索引目录的哈希输入，所以升级后旧缓存会“自然失效”为新目录，
+/// 不会被 `Index::open_in_dir` 用不匹配的 schema 打开而运行时报错。
+const INDEX_FORMAT_VERSION: u32 = 4;
+
 /// schema：path/start_line/end_line/content 四个字段。
 /// content 用自定义 "code" 分词器，且要 WithFreqsAndPositions（BM25 需要词频）。
+/// path / start_line / end_line 仅用于结果展示（从 stored doc 读取），不需要倒排或 fast field。
 pub fn build_schema() -> Schema {
     let mut b = Schema::builder();
-    b.add_text_field(PATH_FIELD, STRING | STORED);
-    b.add_u64_field(START_FIELD, FAST | STORED);
-    b.add_u64_field(END_FIELD, FAST | STORED);
+    b.add_text_field(PATH_FIELD, STORED);
+    b.add_u64_field(START_FIELD, STORED);
+    b.add_u64_field(END_FIELD, STORED);
+    // kind_id：INDEXED 供查询期 kind 过滤（TermQuery），FAST 供收集阶段读取并乘类型权重。
+    b.add_u64_field(KIND_ID_FIELD, INDEXED | FAST);
+    // file：仅索引（不存储），用于增量更新时按 file 精确删除该文件的旧块。
+    b.add_text_field(FILE_FIELD, STRING);
     b.add_text_field(
         CONTENT_FIELD,
         TextOptions::default()
@@ -56,12 +72,14 @@ pub fn build_schema() -> Schema {
     b.build()
 }
 
-fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field)> {
+fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field, Field, Field)> {
     Ok((
         schema.get_field(PATH_FIELD)?,
         schema.get_field(START_FIELD)?,
         schema.get_field(END_FIELD)?,
         schema.get_field(CONTENT_FIELD)?,
+        schema.get_field(KIND_ID_FIELD)?,
+        schema.get_field(FILE_FIELD)?,
     ))
 }
 
@@ -81,7 +99,10 @@ pub fn default_index_dir(root: &Path) -> Result<PathBuf> {
             PathBuf::from(home).join(".cache").join("relation-search")
         }
     };
-    let hash = fnv1a64(canonical.to_string_lossy().as_bytes());
+    // 把索引格式版本拼进哈希输入：schema / 分词器升级后旧目录不再被复用（自动重建）。
+    let mut key = format!("v{INDEX_FORMAT_VERSION}:");
+    key.push_str(&canonical.to_string_lossy());
+    let hash = fnv1a64(key.as_bytes());
     Ok(cache.join(format!("{hash:x}")))
 }
 
@@ -101,15 +122,63 @@ pub struct IndexSummary {
     pub index_dir: PathBuf,
 }
 
-/// 递归扫描 root、切块、写 tantivy 索引（整体重建）。
+/// 索引清单：记录每个文件的内容哈希与块数，用于增量更新（无需每次整仓重建）。
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    format_version: u32,
+    files: HashMap<String, FileEntry>,
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Self {
+            format_version: INDEX_FORMAT_VERSION,
+            files: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileEntry {
+    /// 文件字节数（快速判断是否可能变化）。
+    size: u64,
+    /// 文件内容的 FNV-1a 64 位哈希（跨进程稳定，用于精确判断是否需要重索引）。
+    hash: u64,
+    /// 该文件切出的块数（用于汇总 docs 计数，无需读索引）。
+    chunks: usize,
+}
+
+const MANIFEST_FILE: &str = "manifest.json";
+
+fn read_manifest(index_dir: &Path) -> Option<Manifest> {
+    let text = std::fs::read_to_string(index_dir.join(MANIFEST_FILE)).ok()?;
+    serde_json::from_str::<Manifest>(&text).ok()
+}
+
+fn write_manifest(index_dir: &Path, manifest: &Manifest) -> Result<()> {
+    let text = serde_json::to_string(manifest)?;
+    std::fs::write(index_dir.join(MANIFEST_FILE), text)
+        .with_context(|| format!("无法写入索引清单: {}", index_dir.display()))?;
+    Ok(())
+}
+
+/// 递归扫描 root、切块、写 tantivy 索引。
 ///
-/// 注意：为了「重跑即最新」，若 index_dir 已存在会先删除重建（它是缓存目录语义）。
+/// **增量**：索引目录里有匹配当前 `INDEX_FORMAT_VERSION` 的 `manifest.json` 时，只对
+/// 「新增 / 修改 / 删除」的文件做 `delete_term + add_document`，不再整目录重建；
+/// 否则（首次、或格式版本不符）全量重建。无论哪种，重跑后索引都与当前源码保持一致。
 pub fn index_root(root: &Path, index_dir: &Path) -> Result<IndexSummary> {
     let root = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
 
-    if index_dir.exists() {
+    // 1) 判断能否增量：已有清单且格式版本匹配当前 INDEX_FORMAT_VERSION。
+    let old_manifest =
+        read_manifest(index_dir).filter(|m| m.format_version == INDEX_FORMAT_VERSION);
+    let incremental = old_manifest.is_some() && index_dir.join("meta.json").exists();
+
+    if !incremental && index_dir.exists() {
+        // 全量重建：清理旧目录（首次或格式不兼容）。
         std::fs::remove_dir_all(index_dir)
             .with_context(|| format!("无法清理旧索引目录: {}", index_dir.display()))?;
     }
@@ -119,32 +188,89 @@ pub fn index_root(root: &Path, index_dir: &Path) -> Result<IndexSummary> {
         .canonicalize()
         .with_context(|| format!("无法规范化索引目录: {}", index_dir.display()))?;
 
-    // tantivy 0.27：create_in_dir 要求目录已存在（MmapDirectory::open 不建目录），上面已建。
-    let index = Index::create_in_dir(&index_dir_abs, build_schema())?;
-    // 关键坑：索引与检索都必须注册自定义分词器；index 刚创建时的 TokenizerManager 是默认那套。
-    index.tokenizers().register(TOKENIZER_NAME, CodeTokenizer);
+    // 2) 打开或新建索引。
+    let index = if incremental {
+        Index::open_in_dir(&index_dir_abs)?
+    } else {
+        Index::create_in_dir(&index_dir_abs, build_schema())?
+    };
+    // 关键坑：索引与检索都必须注册自定义分词器。
+    index
+        .tokenizers()
+        .register(TOKENIZER_NAME, build_analyzer());
 
-    let (path_f, start_f, end_f, content_f) = field_ids(&index.schema())?;
+    let (path_f, start_f, end_f, content_f, kind_f, file_f) = field_ids(&index.schema())?;
     let mut writer: IndexWriter<TantivyDocument> = index.writer(WRITER_MEMORY_BUDGET)?;
+    // 增量会不断产生删除墓碑；默认 `del_docs_ratio_before_merge=1.0` 使墓碑永不被 merge 回收，
+    // 调小该比例让 merge 真正清理旧块（配合结尾的 wait_merging_threads）。
+    let mut merge_policy = LogMergePolicy::default();
+    merge_policy.set_del_docs_ratio_before_merge(0.3);
+    writer.set_merge_policy(Box::new(merge_policy));
 
-    let mut count = 0usize;
-    for_each_chunk(&root, |ch| {
-        let document = doc! {
-            path_f => ch.rel_path,
-            start_f => ch.start_line,
-            end_f => ch.end_line,
-            content_f => ch.content,
+    let old_files = old_manifest.map(|m| m.files).unwrap_or_default();
+    let mut new_manifest = Manifest::default();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // 3) 扫描当前文件：未变的沿用旧记录；新增/修改的先按 file 删旧块再写新块。
+    for_each_text_file(&root, |path, content| {
+        let rel = match path.strip_prefix(&root) {
+            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+            Err(_) => return Ok(()),
         };
-        writer.add_document(document)?;
-        count += 1;
+        seen.insert(rel.clone());
+        let size = content.len() as u64;
+        let hash = fnv1a64(content.as_bytes());
+        if let Some(old) = old_files.get(&rel)
+            && old.size == size
+            && old.hash == hash
+        {
+            // 未变化：保留旧记录（其块仍在索引里）。
+            new_manifest.files.insert(rel, old.clone());
+            return Ok(());
+        }
+        // 新增或内容变化：先删掉该文件所有旧块（此前不存在时为空操作），再写入新块。
+        writer.delete_term(Term::from_field_text(file_f, &rel));
+        let kid = kind_id(classify_kind(&rel));
+        let chunks = chunk_text(&rel, content);
+        let n = chunks.len();
+        for ch in chunks {
+            let document = doc! {
+                path_f => ch.rel_path,
+                start_f => ch.start_line,
+                end_f => ch.end_line,
+                content_f => ch.content,
+                kind_f => kid,
+                file_f => rel.clone(),
+            };
+            writer.add_document(document)?;
+        }
+        new_manifest.files.insert(
+            rel,
+            FileEntry {
+                size,
+                hash,
+                chunks: n,
+            },
+        );
         Ok(())
     })?;
 
+    // 4) 处理已删除的文件：在旧清单里但磁盘上已不存在 → 删掉它的块。
+    for old_path in old_files.keys() {
+        if !seen.contains(old_path) {
+            writer.delete_term(Term::from_field_text(file_f, old_path));
+        }
+    }
+
     writer.commit()?;
-    drop(writer); // 释放索引锁
+    // 等待后台 merge 完成再释放 writer：`drop(writer)` 会 kill 掉尚未完成的 merge。
+    writer.wait_merging_threads()?;
+
+    let documents = new_manifest.files.values().map(|e| e.chunks).sum();
+    write_manifest(&index_dir_abs, &new_manifest)?;
 
     Ok(IndexSummary {
-        documents: count,
+        documents,
         index_dir: index_dir_abs,
     })
 }
@@ -181,12 +307,6 @@ pub struct Filter {
     pub include: Vec<String>,
     /// 路径 glob：命中任一即排除（空 = 不排除）。
     pub exclude: Vec<String>,
-}
-
-impl Filter {
-    fn is_active(&self) -> bool {
-        !self.kinds.is_empty() || !self.include.is_empty() || !self.exclude.is_empty()
-    }
 }
 
 /// 编译后的过滤器（glob 只编译一次）。
@@ -265,27 +385,69 @@ pub fn search_root(
         index_root(&root_abs, index_dir)?;
     }
 
-    let index = Index::open_in_dir(index_dir)
+    let mut index = Index::open_in_dir(index_dir)
         .with_context(|| format!("无法打开索引目录: {}", index_dir.display()))?;
+    // 多 segment 时按 segment 并行检索；初始化失败不应让检索本身失败，退回单线程。
+    index.set_default_multithread_executor().ok();
     // 关键坑：open_in_dir 之后 TokenizerManager 不保留，必须重新注册，否则 QueryParser 报
     // "Error getting tokenizer for field"。
-    index.tokenizers().register(TOKENIZER_NAME, CodeTokenizer);
+    index
+        .tokenizers()
+        .register(TOKENIZER_NAME, build_analyzer());
 
-    let (path_f, start_f, end_f, content_f) = field_ids(&index.schema())?;
+    let (path_f, start_f, end_f, content_f, kind_f, _file_f) = field_ids(&index.schema())?;
     let reader = index.reader()?;
     let searcher = reader.searcher();
-    let query_ast = build_query(content_f, query);
-    // 有「硬过滤」时放宽候选池（过滤会丢很多），否则维持原池再做权重/每文件上限重排。
+    // 1) 内容查询（代码片段安全：分词后按词项 OR 召回，不用 QueryParser）。
+    let content_query = build_query(content_f, query);
+    // 2) kind 硬过滤下推到查询期：只对目标 kind 的子集做 BM25，避免「先取小池再后过滤」丢候选。
+    let query_ast: Box<dyn Query> = if filter.kinds.is_empty() {
+        content_query
+    } else {
+        let mut kind_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for k in &filter.kinds {
+            let term = Term::from_field_u64(kind_f, kind_id(k));
+            kind_clauses.push((
+                Occur::Should,
+                Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+            ));
+        }
+        Box::new(BooleanQuery::new(vec![
+            (Occur::Must, content_query),
+            (
+                Occur::Must,
+                Box::new(BooleanQuery::new(kind_clauses)) as Box<dyn Query>,
+            ),
+        ]))
+    };
+    // 3) 摘要生成器用最终查询（内部只收集 content 字段的词项）。
+    let mut snippet_gen = SnippetGenerator::create(&searcher, query_ast.as_ref(), content_f)?;
+    snippet_gen.set_max_num_chars(240);
     let compiled = CompiledFilter::compile(filter)?;
-    let pool = if filter.is_active() {
+    // kind 已在查询期过滤；只有 include/exclude 这类路径后过滤需要放大候选池补偿。
+    let path_filter_active = !filter.include.is_empty() || !filter.exclude.is_empty();
+    let pool = if path_filter_active {
         limit.saturating_mul(20).clamp(200, 2000)
     } else {
         limit.saturating_mul(POOL_FACTOR).clamp(POOL_MIN, POOL_MAX)
     };
-    let top = searcher.search(
-        query_ast.as_ref(),
-        &TopDocs::with_limit(pool).order_by_score(),
-    )?;
+    // 4) 收集阶段按 kind 权重加权（tweak_score 从 FAST 字段读 kind_id），
+    //    使「代码优先」在加权分数上选 top-pool，而不是先按原始 BM25 取池再重排。
+    let collector = TopDocs::with_limit(pool).tweak_score(move |segment_reader: &SegmentReader| {
+        let kind_col = segment_reader
+            .fast_fields()
+            .u64(KIND_ID_FIELD)
+            .ok()
+            .map(|c| c.first_or_default_col(0));
+        move |doc: DocId, original_score: Score| -> f64 {
+            let weight = kind_col
+                .as_ref()
+                .map(|c| kind_weight_from_id(c.get_val(doc)))
+                .unwrap_or(1.0);
+            f64::from(original_score) * weight
+        }
+    });
+    let top = searcher.search(query_ast.as_ref(), &collector)?;
 
     let mut candidates: Vec<Candidate> = Vec::with_capacity(top.len());
     for (raw_score, addr) in top {
@@ -306,23 +468,49 @@ pub fn search_root(
             continue;
         }
         candidates.push(Candidate {
-            score: f64::from(raw_score) * kind_weight(kind),
+            // raw_score 已是 tweak_score 加权后的最终分（含 kind 权重）。
+            score: raw_score,
             kind: kind.to_string(),
             symbol: extract_symbol(content),
             path,
             start_line,
             end_line,
-            snippet: make_snippet(content, query),
+            snippet: snippet_text(&snippet_gen, content),
             source: "bm25".to_string(),
         });
     }
-    // 权重已并入 score；按 score 降序、每文件最多 PER_FILE_CAP 块，取前 limit。
+    // 权重已并入 score；先按 score 降序（BM25 结果）。
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let mut candidates = cap_per_file(candidates, PER_FILE_CAP, limit);
 
+    // 可选：ast-grep 结构召回。与 BM25 做「去重 + 融合」而不是无脑 append：
+    // - 同一文件里与已有 BM25 候选行区间重叠的 AST 命中跳过（避免重复展示同一段代码）；
+    // - 其余 AST 命中给一个「略低于最弱 BM25 候选」的基础分（BM25 为空时给 0），
+    //   使其能进榜且排序稳定，但不会压过内容命中；最后统一 cap_per_file + 截断到 limit。
     if let Some(pattern) = ast_pattern {
-        candidates.extend(ast_candidates(&root_abs, pattern, limit, &compiled));
+        let ast = ast_candidates(&root_abs, pattern, limit, &compiled);
+        let base = candidates
+            .last()
+            .map(|c| c.score)
+            .filter(|s| *s > 0.0)
+            .map(|s| s * 0.5)
+            .unwrap_or(0.0);
+        let mut added = 0usize;
+        for mut a in ast {
+            let overlaps = candidates.iter().any(|c| {
+                c.path == a.path
+                    && ranges_overlap(c.start_line, c.end_line, a.start_line, a.end_line)
+            });
+            if overlaps {
+                continue;
+            }
+            a.score = (base - (added as f64) * 1e-6).max(0.0);
+            candidates.push(a);
+            added += 1;
+        }
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
+
+    let candidates = cap_per_file(candidates, PER_FILE_CAP, limit);
 
     Ok(SearchJson {
         query: query.to_string(),
@@ -337,7 +525,7 @@ pub fn search_root(
 /// 关键：**不走 tantivy 的 `QueryParser`**。用户给的多半是代码片段（`IndexWriter::commit`、
 /// `fn(user_id)`、`foo[0]`、`"xxx`），`QueryParser` 会把 `:`/`[`/`(`/引号当成查询语法而直接
 /// 报语法错（整个 search 退出码非 0），也会把 `-`/`|`/`.` 拆成的多段强绑成「相邻短语」
-/// （`index-writing` 反而搜不到）。这里复用建索引时的同一个 `CodeTokenizer` 把查询切成词项：
+/// （`index-writing` 反而搜不到）。这里复用建索引时的同一个分析管线（`build_analyzer`）把查询切成词项：
 /// - 每个词项一条 `TermQuery`（`Should`/OR）：任一命中即可召回，标点不再是语法；
 /// - 词项多于一个时再加一条整串 `PhraseQuery`（`Should`）：词项**相邻**出现（如完整标识符
 ///   `user_profile_cache`）时额外贡献 BM25 分，把「精确命中该符号」的块排到更前。
@@ -431,74 +619,19 @@ fn ast_candidates(
     out
 }
 
-/// snippet：在所有查询词项的出现位置里，选一个「覆盖最多不同词项」的 ~240 字节窗口；
-/// 只按首个 token 定位会漏掉「多个词分散出现」的块。一个都没找到就取前 240 字符。
-fn make_snippet(content: &str, query: &str) -> String {
-    let mut seen: HashSet<String> = HashSet::new();
-    let tokens: Vec<String> = tokenize_to_strings(query)
-        .into_iter()
-        .filter(|t| !t.is_empty() && seen.insert(t.clone()))
-        .collect();
-    if tokens.is_empty() {
-        return truncate_chars(content, 240);
+/// 用 tantivy 的 SnippetGenerator 生成摘要片段；取不到片段时退化为「取前 240 字符」。
+fn snippet_text(generator: &SnippetGenerator, content: &str) -> String {
+    let snippet = generator.snippet(content);
+    let fragment = snippet.fragment();
+    if fragment.is_empty() {
+        truncate_chars(content, 240)
+    } else {
+        fragment.to_string()
     }
-    let mut best: Option<(usize, String)> = None;
-    for token in &tokens {
-        let Some(pos) = find_ci(content, token) else {
-            continue;
-        };
-        let window = window_around(content, pos, 240, 80);
-        let window_lower = window.to_lowercase();
-        let distinct = tokens
-            .iter()
-            .filter(|t| window_lower.contains(&t.to_lowercase()))
-            .count();
-        if best.as_ref().is_none_or(|(b, _)| distinct > *b) {
-            best = Some((distinct, window));
-        }
-    }
-    best.map(|(_, w)| w)
-        .unwrap_or_else(|| truncate_chars(content, 240))
-}
-
-/// 大小写不敏感查找，返回在 hay 里的字节位置。
-fn find_ci(hay: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    hay.to_lowercase().find(&needle.to_lowercase())
-}
-
-/// 以 pos 为中心向前 back 字节起、总长约 len 字节取窗口（对齐 UTF-8 边界）。
-fn window_around(content: &str, pos: usize, len: usize, back: usize) -> String {
-    let start = floor_char_boundary(content, pos.saturating_sub(back));
-    let end = ceil_char_boundary(content, start.saturating_add(len));
-    content[start..end].to_string()
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
-}
-
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    if i > s.len() {
-        i = s.len();
-    }
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
-    let n = s.len();
-    if i >= n {
-        return n;
-    }
-    while i < n && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
 }
 
 /// 判断文件类型：代码 / 测试 / 文档 / 配置 / 生成物 / 其它。
@@ -602,6 +735,40 @@ fn kind_weight(kind: &str) -> f64 {
         "generated" => 0.15,
         _ => 0.60,
     }
+}
+
+/// kind 名称 → 稳定编号（写入 kind_id 字段；已有编号不要改，否则旧语义漂移）。
+fn kind_id(kind: &str) -> u64 {
+    match kind {
+        "code" => 0,
+        "test" => 1,
+        "doc" => 2,
+        "config" => 3,
+        "generated" => 4,
+        _ => 5,
+    }
+}
+
+/// 编号 → kind 名称（与 kind_id 对应）。
+fn kind_from_id(id: u64) -> &'static str {
+    match id {
+        0 => "code",
+        1 => "test",
+        2 => "doc",
+        3 => "config",
+        4 => "generated",
+        _ => "other",
+    }
+}
+
+/// 编号对应的排序权重（复用 kind_weight，保证两处一致）。
+fn kind_weight_from_id(id: u64) -> f64 {
+    kind_weight(kind_from_id(id))
+}
+
+/// 两个 1 基闭区间 [a1,a2] 与 [b1,b2] 是否重叠。
+fn ranges_overlap(a1: u64, a2: u64, b1: u64, b2: u64) -> bool {
+    a1 <= b2 && b1 <= a2
 }
 
 /// 按「每文件最多 per_file 块」过滤并截断到 limit 条；在已按 score 排序的前提下使用。
@@ -775,34 +942,6 @@ mod tests {
         let out = cap_per_file(items, 2, 10);
         assert_eq!(out.len(), 3);
         assert_eq!(out.iter().filter(|c| c.path == "a.rs").count(), 2);
-    }
-
-    #[test]
-    fn snippet_centers_on_token() {
-        let content = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa用户资料缓存就是这里";
-        let snip = make_snippet(content, "用户资料缓存");
-        assert!(snip.contains("用户资料缓存"));
-        assert!(snip.chars().count() <= 240);
-    }
-
-    #[test]
-    fn snippet_falls_back_to_head() {
-        let content = "hello world";
-        assert_eq!(make_snippet(content, "zzz"), "hello world");
-    }
-
-    #[test]
-    fn snippet_prefers_window_covering_more_tokens() {
-        // 首词后隔了很远才出现后两个词：只按首词定位的窗口只能覆盖 1 个词，
-        // 应改为选中覆盖 2 个词的尾部窗口。
-        let filler = "x".repeat(400);
-        let content = format!("alpha {filler} beta gamma");
-        let snip = make_snippet(&content, "alpha beta gamma");
-        assert!(
-            snip.contains("beta") && snip.contains("gamma"),
-            "snippet={snip}"
-        );
-        assert!(snip.chars().count() <= 240);
     }
 
     #[test]

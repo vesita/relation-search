@@ -91,26 +91,6 @@ pub fn for_each_text_file(
     Ok(())
 }
 
-/// 遍历 root、切块，对每块调用 `sink`。返回块总数。
-pub fn for_each_chunk(root: &Path, mut sink: impl FnMut(Chunk) -> Result<()>) -> Result<usize> {
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
-    let mut total = 0usize;
-    for_each_text_file(&root, |path, content| {
-        let rel = match path.strip_prefix(&root) {
-            Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => return Ok(()),
-        };
-        for chunk in chunk_text(&rel, content) {
-            sink(chunk)?;
-            total += 1;
-        }
-        Ok(())
-    })?;
-    Ok(total)
-}
-
 /// 是否是应当跳过的目录（root 自身不跳过）。
 fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
     if entry.depth() == 0 {
@@ -124,8 +104,8 @@ fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
             .unwrap_or(false)
 }
 
-/// 把文件内容按空行切段并贪心合并成块。
-fn chunk_text(rel_path: &str, content: &str) -> Vec<Chunk> {
+/// 把文件内容按空行切段并贪心合并成块（供索引与增量更新共用）。
+pub(crate) fn chunk_text(rel_path: &str, content: &str) -> Vec<Chunk> {
     let lines: Vec<&str> = content.split('\n').collect();
 
     // 找出所有非空段（连续非空行）的 [start, end) 零基行区间。

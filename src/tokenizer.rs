@@ -15,7 +15,9 @@
 
 use std::sync::OnceLock;
 
-use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
+use tantivy::tokenizer::{
+    AsciiFoldingFilter, RemoveLongFilter, TextAnalyzer, Token, TokenStream, Tokenizer,
+};
 
 /// 注册到 tantivy `TokenizerManager` 的名字，索引与检索两处必须一致。
 pub const TOKENIZER_NAME: &str = "code";
@@ -57,32 +59,13 @@ fn tokenize_code(text: &str) -> Vec<Token> {
         *pos += 1;
     };
 
-    // 按字符类别把原文切成连续 run：ASCII 字母数字 / CJK / 其它 Unicode 字母数字 / 分隔符。
+    // 按字符类别把原文切成连续 run：CJK / 字母数字（ASCII 与其它 Unicode 合并，便于后续 ASCII 折叠）/ 分隔符。
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let n = chars.len();
     let mut i = 0usize;
     while i < n {
         let c = chars[i].1;
-        if c.is_ascii_alphanumeric() {
-            // 收集 ASCII 字母数字 run。
-            let run_start = chars[i].0;
-            let mut j = i;
-            while j < n && chars[j].1.is_ascii_alphanumeric() {
-                j += 1;
-            }
-            let run_end = if j < n { chars[j].0 } else { text.len() };
-            let run = &text[run_start..run_end];
-            for (from, to) in split_ascii_ident(run) {
-                push(
-                    &mut tokens,
-                    run[from..to].to_ascii_lowercase(),
-                    run_start + from,
-                    run_start + to,
-                    &mut position,
-                );
-            }
-            i = j;
-        } else if is_cjk(c) {
+        if is_cjk(c) {
             // 收集 CJK 连续串，交给 jieba。
             let run_start = chars[i].0;
             let mut j = i;
@@ -102,7 +85,8 @@ fn tokenize_code(text: &str) -> Vec<Token> {
             }
             i = j;
         } else if c.is_alphanumeric() {
-            // 其它 Unicode 字母数字（重音字母等），整段作为一个 token，只做小写。
+            // 收集「字母数字（非 CJK）」run：ASCII 与带重音的拉丁字母合并在一起，
+            // 这样 café 是一个整词（后续折叠成 cafe），而不是被拆成 caf + e。
             let run_start = chars[i].0;
             let mut j = i;
             while j < n && chars[j].1.is_alphanumeric() && !is_cjk(chars[j].1) {
@@ -110,13 +94,15 @@ fn tokenize_code(text: &str) -> Vec<Token> {
             }
             let run_end = if j < n { chars[j].0 } else { text.len() };
             let run = &text[run_start..run_end];
-            push(
-                &mut tokens,
-                run.to_lowercase(),
-                run_start,
-                run_end,
-                &mut position,
-            );
+            for (from, to) in split_ascii_ident(run) {
+                push(
+                    &mut tokens,
+                    run[from..to].to_lowercase(),
+                    run_start + from,
+                    run_start + to,
+                    &mut position,
+                );
+            }
             i = j;
         } else {
             // 分隔符，跳过。
@@ -143,10 +129,10 @@ fn split_ascii_ident(ident: &str) -> Vec<(usize, usize)> {
         let cur = ci[i].1;
         let next = if i + 1 < n { Some(ci[i + 1].1) } else { None };
         let boundary = (cur.is_ascii_digit() != prev.is_ascii_digit())
-            || (cur.is_ascii_uppercase() && prev.is_ascii_lowercase())
-            || (cur.is_ascii_uppercase()
-                && prev.is_ascii_uppercase()
-                && matches!(next, Some(c) if c.is_ascii_lowercase()));
+            || (cur.is_uppercase() && prev.is_lowercase())
+            || (cur.is_uppercase()
+                && prev.is_uppercase()
+                && matches!(next, Some(c) if c.is_lowercase()));
         if boundary {
             spans.push((ci[start].0, ci[i].0));
             start = i;
@@ -197,9 +183,28 @@ impl TokenStream for VecTokenStream {
     }
 }
 
-/// 把任意文本切成小写 token 字符串列表，供 snippet 定位首个 token 使用。
+/// 构建索引与查询**共用**的文本分析管线：代码分词 + 超长 token 过滤 + ASCII 折叠。
+///
+/// - `RemoveLong(64)`：丢弃 minified / 压缩产物里的超长串，避免膨胀词典。
+/// - `AsciiFolding`：把带重音的拉丁字母折叠成 ASCII（`café` → `cafe`），让注释里的重音词可被普通拼写命中。
+///
+/// 索引与查询必须走同一管线，否则两侧词项对不上（折叠后尤其明显）。
+pub fn build_analyzer() -> TextAnalyzer {
+    TextAnalyzer::builder(CodeTokenizer)
+        .filter(RemoveLongFilter::limit(64))
+        .filter(AsciiFoldingFilter)
+        .build()
+}
+
+/// 把任意文本切成小写 token 字符串列表（走与索引相同的分析管线，保证查询词项对齐）。
 pub fn tokenize_to_strings(text: &str) -> Vec<String> {
-    tokenize_code(text).into_iter().map(|t| t.text).collect()
+    let mut analyzer = build_analyzer();
+    let mut stream = analyzer.token_stream(text);
+    let mut out = Vec::new();
+    while stream.advance() {
+        out.push(stream.token().text.clone());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -252,5 +257,18 @@ mod tests {
         let tokens = tokenize_code("aa bb cc");
         let positions: Vec<usize> = tokens.iter().map(|t| t.position).collect();
         assert_eq!(positions, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn ascii_folding_and_remove_long() {
+        // 重音折叠：café → cafe（索引与查询共用同一管线，故两侧都能命中）。
+        assert_eq!(toks("café"), vec!["cafe"]);
+        // 重音 + 驼峰混合仍应在驼峰边界拆词：caféTest → cafe + test。
+        assert_eq!(toks("caféTest"), vec!["cafe", "test"]);
+        // 超长 token（>64）被 RemoveLongFilter 丢弃，避免 minified 串膨胀词典。
+        let too_long = "a".repeat(100);
+        assert!(toks(&too_long).is_empty(), ">64 的 token 应被过滤");
+        let ok = "a".repeat(60);
+        assert_eq!(toks(&ok), vec![ok]);
     }
 }
