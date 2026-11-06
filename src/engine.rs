@@ -13,7 +13,10 @@ use tantivy::schema::{
 };
 use tantivy::{doc, Index, IndexWriter, TantivyDocument};
 
-use crate::chunk::for_each_chunk;
+use ast_grep_core::Pattern;
+use ast_grep_language::{Language, LanguageExt, SupportLang};
+
+use crate::chunk::{for_each_chunk, for_each_text_file};
 use crate::tokenizer::{tokenize_to_strings, CodeTokenizer, TOKENIZER_NAME};
 
 const PATH_FIELD: &str = "path";
@@ -204,7 +207,7 @@ pub fn search_root(
     }
 
     if let Some(pattern) = ast_pattern {
-        append_ast_candidates(&root_abs, pattern, limit, &mut candidates);
+        candidates.extend(ast_candidates(&root_abs, pattern, limit));
     }
 
     Ok(SearchJson {
@@ -215,76 +218,47 @@ pub fn search_root(
     })
 }
 
-/// 若 PATH 里有 sg / ast-grep，跑结构搜索并并入 candidates；否则静默跳过。
-fn append_ast_candidates(root: &Path, pattern: &str, limit: usize, out: &mut Vec<Candidate>) {
-    let Some(bin) = find_binary(&["sg", "ast-grep"]) else {
-        return; // 没装 sg：静默跳过，仍返回 bm25 结果
+/// 用内嵌 ast-grep（tree-sitter 语法已编入二进制）做结构搜索，无需外部 `sg`。
+/// 按文件扩展名判定语言；该语言不支持或 pattern 解析失败的文件跳过。
+fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate> {
+    let mut out: Vec<Candidate> = Vec::new();
+    let root = match root.canonicalize() {
+        Ok(r) => r,
+        Err(_) => return out,
     };
-    let output = std::process::Command::new(bin)
-        .arg("-p")
-        .arg(pattern)
-        .arg("--json")
-        .arg(root)
-        .output();
-    let Ok(output) = output else {
-        return;
-    };
-    if !output.status.success() {
-        return;
-    }
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return;
-    };
-    let Some(items) = value.as_array() else {
-        return;
-    };
-    for item in items.iter().take(limit) {
-        let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("");
-        if file.is_empty() {
-            continue;
+    let _ = for_each_text_file(&root, |path, content| {
+        if out.len() >= limit {
+            return Ok(());
         }
-        // ast-grep 的 line 是 0 基，转 1 基。
-        let start_line = item
-            .pointer("/range/start/line")
-            .and_then(|v| v.as_u64())
-            .map(|l| l + 1)
-            .unwrap_or(0);
-        let end_line = item
-            .pointer("/range/end/line")
-            .and_then(|v| v.as_u64())
-            .map(|l| l + 1)
-            .unwrap_or(0);
-        let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-        let lines = item.get("lines").and_then(|v| v.as_str()).unwrap_or("");
-        let snippet = if lines.is_empty() { text } else { lines };
-        let path = Path::new(file);
+        let Some(lang) = SupportLang::from_path(path) else {
+            return Ok(());
+        };
+        let pattern = match Pattern::try_new(pattern_src, lang) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let source = lang.ast_grep(content);
+        let root_node = source.root();
         let rel = path
-            .strip_prefix(root)
+            .strip_prefix(&root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| file.to_string());
-        out.push(Candidate {
-            path: rel,
-            start_line,
-            end_line,
-            score: 0.0,
-            snippet: truncate_chars(snippet, 240),
-            source: "ast".to_string(),
-        });
-    }
-}
-
-/// 在 PATH 里查找第一个存在的可执行文件名。
-fn find_binary(names: &[&str]) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        for name in names {
-            let candidate = dir.join(name);
-            if candidate.is_file() {
-                return Some(candidate);
+            .unwrap_or_default();
+        for m in root_node.find_all(pattern) {
+            if out.len() >= limit {
+                break;
             }
+            out.push(Candidate {
+                path: rel.clone(),
+                start_line: m.start_pos().line() as u64 + 1,
+                end_line: m.end_pos().line() as u64 + 1,
+                score: 0.0,
+                snippet: truncate_chars(&m.text(), 240),
+                source: "ast".to_string(),
+            });
         }
-    }
-    None
+        Ok(())
+    });
+    out
 }
 
 /// snippet：围绕 query 首个 token 的位置截 ~240 字符，找不到就取前 240 字符。

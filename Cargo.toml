@@ -13,6 +13,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 tantivy = "0.27"
 jieba-rs = "0.11"
+ast-grep-core = "0.51"
+ast-grep-language = "0.51"
 walkdir = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

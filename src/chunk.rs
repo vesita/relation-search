@@ -45,8 +45,12 @@ pub struct Chunk {
     pub content: String,
 }
 
-/// 遍历 root 下所有文件，对每个切出的块调用 `sink`。返回块总数。
-pub fn for_each_chunk(root: &Path, mut sink: impl FnMut(Chunk) -> Result<()>) -> Result<usize> {
+/// 遍历 root 下所有可索引文本文件，对每个 (绝对路径, 内容) 调用 `sink`。
+/// 跳过规则与大小/编码判断集中在这里，供切块（BM25）与 ast 结构搜索共用。
+pub fn for_each_text_file(
+    root: &Path,
+    mut sink: impl FnMut(&Path, &str) -> Result<()>,
+) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
@@ -56,7 +60,6 @@ pub fn for_each_chunk(root: &Path, mut sink: impl FnMut(Chunk) -> Result<()>) ->
         .into_iter()
         .filter_entry(|e| !is_skipped_dir(e));
 
-    let mut total = 0usize;
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -83,15 +86,28 @@ pub fn for_each_chunk(root: &Path, mut sink: impl FnMut(Chunk) -> Result<()>) ->
             Ok(s) => s,
             Err(_) => continue, // 非 UTF-8 文本跳过
         };
-        let rel = match entry.path().strip_prefix(&root) {
+        sink(entry.path(), &content)?;
+    }
+    Ok(())
+}
+
+/// 遍历 root、切块，对每块调用 `sink`。返回块总数。
+pub fn for_each_chunk(root: &Path, mut sink: impl FnMut(Chunk) -> Result<()>) -> Result<usize> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
+    let mut total = 0usize;
+    for_each_text_file(&root, |path, content| {
+        let rel = match path.strip_prefix(&root) {
             Ok(p) => p.to_string_lossy().replace('\\', "/"),
-            Err(_) => continue,
+            Err(_) => return Ok(()),
         };
-        for chunk in chunk_text(&rel, &content) {
+        for chunk in chunk_text(&rel, content) {
             sink(chunk)?;
             total += 1;
         }
-    }
+        Ok(())
+    })?;
     Ok(total)
 }
 

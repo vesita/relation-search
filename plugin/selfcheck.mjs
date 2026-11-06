@@ -29,4 +29,14 @@ assert.ok(
   value.candidates.some((c) => String(c.path).includes('user_profile.rs')),
   '候选里应命中 src/user_profile.rs',
 )
-console.log('OK: 插件注册成功，检索返回候选')
+
+// 内嵌 ast-grep 结构召回：pattern 走 tree-sitter，无需外部 sg。
+const astValue = await tool.execute(
+  { query: 'zzz_nomatch_zzz', root, astPattern: 'def $F($$$): $$$' },
+  { agent: {}, signal: undefined },
+)
+assert.ok(
+  astValue.candidates.some((c) => c.source === 'ast' && String(c.path).includes('profile.py')),
+  'ast 结构召回应命中 app/profile.py',
+)
+console.log('OK: 插件注册成功，BM25 与内嵌 ast 结构召回均返回候选')

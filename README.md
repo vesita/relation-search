@@ -23,6 +23,7 @@ code-reuse-search search --root <path> [--index-dir <dir>] --query <q> [--limit 
   ]}
   ```
   `source` 取 `bm25` 或 `ast`；无命中时 `count:0,"candidates":[]`，退出码 0。
+- `--ast-pattern <p>` 的 ast-grep 结构召回**已编入二进制**（`ast-grep-core` + `ast-grep-language`，tree-sitter 语法随包），无需另装 `sg`/`ast-grep`。
 - 出错向 stderr 打印原因、退出码非 0。
 - 默认索引目录：`${CRS_CACHE_DIR:-$HOME/.cache/code-reuse-search}/<对 root 稳定哈希>`。
 

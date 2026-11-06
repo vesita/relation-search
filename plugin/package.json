@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-reuse-search",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek Harness plugin: expose a code_reuse_search tool (tantivy BM25 + jieba + optional ast-grep) so the agent searches existing implementations before writing new ones",
   "license": "MIT",
   "type": "module",

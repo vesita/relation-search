@@ -2,7 +2,7 @@
 
 把 `code-reuse-search` Rust 引擎包成 dsh 工具 `code_reuse_search`。
 
-- 工具参数：`query`（必填）、`root`（默认会话工作目录）、`limit`（默认 8）、`astPattern`（可选 ast-grep 模式）。
+- 工具参数：`query`（必填）、`root`（默认会话工作目录）、`limit`（默认 8）、`astPattern`（可选 ast-grep 模式；ast-grep 已编入引擎二进制，无需外部 `sg`）。
 - 首次对一个 root 检索会自动 `index`，之后复用缓存索引。
 - 二进制解析顺序：`CRS_BIN` → 包内 `bin/code-reuse-search` → 仓库 `../../target/release/code-reuse-search` → PATH。
 

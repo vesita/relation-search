@@ -3,7 +3,7 @@
 开发新功能前的**库内旧实现检索**工具。配套用户级 skill：`search-before-implement`（策略）+ 本插件（能力）。
 
 ## 结构
-- `Cargo.toml` + `src/`：Rust 引擎（tantivy BM25 + 代码感知分词 + jieba-rs 中文分词 + 可选 ast-grep 结构召回）。
+- `Cargo.toml` + `src/`：Rust 引擎（tantivy BM25 + 代码感知分词 + jieba-rs 中文分词 + 内嵌 ast-grep 结构召回，tree-sitter 语法随二进制，无需外部工具）。
 - `plugin/`：dsh 插件，`defineTool` 包装引擎，工具名 `code_reuse_search`。
 - `fixtures/sample/`：插件端到端自检用的样例仓库。
 
