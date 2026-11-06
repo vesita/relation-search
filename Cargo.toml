@@ -1,0 +1,18 @@
+[package]
+name = "code-reuse-search"
+version = "0.1.0"
+edition = "2021"
+description = "代码检索引擎：tantivy BM25 + 代码感知分词 + 可选 ast-grep 结构召回"
+
+[[bin]]
+name = "code-reuse-search"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tantivy = "0.27"
+jieba-rs = "0.11"
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
