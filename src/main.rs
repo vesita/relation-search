@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use code_reuse_search::engine::{default_index_dir, index_root, search_root};
+use code_search::engine::{default_index_dir, index_root, search_root};
 
 #[derive(Parser)]
 #[command(
-    name = "code-reuse-search",
+    name = "code-search",
     version,
     about = "库内旧实现检索：tantivy BM25 + 代码感知分词 + 可选 ast-grep 结构召回"
 )]

@@ -1,11 +1,11 @@
 [package]
-name = "code-reuse-search"
-version = "0.1.0"
+name = "code-search"
+version = "0.2.0"
 edition = "2021"
-description = "代码检索引擎：tantivy BM25 + 代码感知分词 + 可选 ast-grep 结构召回"
+description = "代码检索：tantivy BM25 + 代码感知分词 + 内嵌 ast-grep 结构召回（无需外部工具）"
 
 [[bin]]
-name = "code-reuse-search"
+name = "code-search"
 path = "src/main.rs"
 
 [dependencies]

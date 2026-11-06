@@ -56,18 +56,18 @@ fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field)> {
     ))
 }
 
-/// 默认索引目录：`${CRS_CACHE_DIR:-$HOME/.cache/code-reuse-search}/<canonical root 的稳定哈希>`。
+/// 默认索引目录：`${CODE_SEARCH_CACHE_DIR:-$HOME/.cache/code-search}/<canonical root 的稳定哈希>`。
 /// 用 DefaultHasher 十六进制；同一 root 每次得到同一目录。
 pub fn default_index_dir(root: &Path) -> Result<PathBuf> {
     let canonical = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
-    let cache = match std::env::var_os("CRS_CACHE_DIR") {
+    let cache = match std::env::var_os("CODE_SEARCH_CACHE_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
             let home = std::env::var_os("HOME")
-                .context("HOME 环境变量未设置，无法确定默认缓存目录（可设 CRS_CACHE_DIR 覆盖）")?;
-            PathBuf::from(home).join(".cache").join("code-reuse-search")
+                .context("HOME 环境变量未设置，无法确定默认缓存目录（可设 CODE_SEARCH_CACHE_DIR 覆盖）")?;
+            PathBuf::from(home).join(".cache").join("code-search")
         }
     };
     let mut hasher = DefaultHasher::new();

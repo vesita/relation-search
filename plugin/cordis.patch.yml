@@ -1,3 +1,3 @@
 - insert:
-    - id: code-reuse-search
-      name: dsh-code-reuse-search
+    - id: code-search
+      name: dsh-code-search
