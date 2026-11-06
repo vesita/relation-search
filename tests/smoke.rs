@@ -9,7 +9,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_code-search")
+    env!("CARGO_BIN_EXE_relation-search")
 }
 
 /// 造一个独一无二的临时目录。

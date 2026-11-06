@@ -1,5 +1,5 @@
 // 插件自检：对**构建产物** lib/index.js 跑，不依赖 dsh 运行时。
-// 判据：注册出名为 code_search 的工具，且对 fixtures/sample 检索能返回候选。
+// 判据：注册出名为 relation_search 的工具，且对 fixtures/sample 检索能返回候选。
 // 前置：cargo build --release 已产出引擎二进制（插件会自行解析到 ../../target/release）。
 import assert from 'node:assert/strict'
 import { resolve } from 'node:path'
@@ -15,7 +15,7 @@ apply(ctx)
 
 assert.equal(registered.length, 1, '应注册且仅注册一个工具')
 const tool = registered[0]
-assert.equal(tool.name, 'code_search', '工具名必须是 code_search')
+assert.equal(tool.name, 'relation_search', '工具名必须是 relation_search')
 
 const root = resolve(process.cwd(), '..', 'fixtures', 'sample')
 const value = await tool.execute(

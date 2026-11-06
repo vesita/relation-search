@@ -64,20 +64,20 @@ fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field)> {
     ))
 }
 
-/// 默认索引目录：`${CODE_SEARCH_CACHE_DIR:-$HOME/.cache/code-search}/<canonical root 的稳定哈希>`。
+/// 默认索引目录：`${RELATION_SEARCH_CACHE_DIR:-$HOME/.cache/relation-search}/<canonical root 的稳定哈希>`。
 /// 哈希必须跨进程、跨 Rust 版本稳定（缓存目录语义）：`DefaultHasher` 的文档明确不保证这一点，
 /// 一旦算法随版本变化，旧缓存就会变成永远命中不了的孤儿目录，所以这里用固定常量的 FNV-1a。
 pub fn default_index_dir(root: &Path) -> Result<PathBuf> {
     let canonical = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
-    let cache = match std::env::var_os("CODE_SEARCH_CACHE_DIR") {
+    let cache = match std::env::var_os("RELATION_SEARCH_CACHE_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
             let home = std::env::var_os("HOME").context(
-                "HOME 环境变量未设置，无法确定默认缓存目录（可设 CODE_SEARCH_CACHE_DIR 覆盖）",
+                "HOME 环境变量未设置，无法确定默认缓存目录（可设 RELATION_SEARCH_CACHE_DIR 覆盖）",
             )?;
-            PathBuf::from(home).join(".cache").join("code-search")
+            PathBuf::from(home).join(".cache").join("relation-search")
         }
     };
     let hash = fnv1a64(canonical.to_string_lossy().as_bytes());

@@ -1,11 +1,11 @@
 {
-  "name": "dsh-code-search",
+  "name": "dsh-relation-search",
   "version": "0.2.4",
-  "description": "DeepSeek Harness plugin: code retrieval tool code_search (tantivy BM25 + jieba + embedded ast-grep) so the agent searches existing code before writing new implementations",
+  "description": "DeepSeek Harness plugin: code retrieval tool relation_search (tantivy BM25 + jieba + embedded ast-grep) so the agent searches existing code before writing new implementations",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/vesita/code-search.git"
+    "url": "https://github.com/vesita/relation-search.git"
   },
   "type": "module",
   "exports": {
@@ -19,7 +19,7 @@
     "lib/**/*.js",
     "lib/**/*.d.ts",
     "cordis.patch.yml",
-    "bin/code-search",
+    "bin/relation-search",
     "README.md"
   ],
   "scripts": {
