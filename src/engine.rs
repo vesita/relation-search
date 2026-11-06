@@ -8,16 +8,16 @@ use serde::Serialize;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, Term, TextFieldIndexing, TextOptions, Value, FAST, STORED,
-    STRING,
+    FAST, Field, IndexRecordOption, STORED, STRING, Schema, Term, TextFieldIndexing, TextOptions,
+    Value,
 };
-use tantivy::{doc, Index, IndexWriter, TantivyDocument};
+use tantivy::{Index, IndexWriter, TantivyDocument, doc};
 
 use ast_grep_core::Pattern;
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 
 use crate::chunk::{for_each_chunk, for_each_text_file};
-use crate::tokenizer::{tokenize_to_strings, CodeTokenizer, TOKENIZER_NAME};
+use crate::tokenizer::{CodeTokenizer, TOKENIZER_NAME, tokenize_to_strings};
 
 const PATH_FIELD: &str = "path";
 const START_FIELD: &str = "start_line";
