@@ -101,7 +101,7 @@ export function apply(ctx: any): void {
   const codeReuseSearchTool = defineTool({
     name: 'relation_search',
     description:
-      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 全文 + 代码分词 + 可选 ast-grep 结构匹配）。默认代码优先（文档/配置降权、每文件最多 2 块），返回候选的文件:行、代码片段、文件类型 kind 与所在 symbol、命中来源，用于判断能否复用旧实现、避免重复造轮子。',
+      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 全文 + 代码分词 + 可选 ast-grep 结构匹配）。默认代码优先（文档/配置/生成物降权、每文件最多 2 块）；可选 kinds/include/exclude 做硬过滤。返回候选的文件:行、代码片段、文件类型 kind 与所在 symbol、命中来源，用于判断能否复用旧实现、避免重复造轮子。',
     parameters: {
       query: {
         type: 'string',
@@ -119,6 +119,18 @@ export function apply(ctx: any): void {
       astPattern: {
         type: 'string',
         description: '可选 ast-grep 结构模式（如 "function $F($$$) { $$$ }"），额外做一次结构召回。',
+      },
+      kinds: {
+        type: 'string',
+        description: '可选：硬过滤，只保留这些类型（逗号分隔：code/test/doc/config/generated/other）。',
+      },
+      include: {
+        type: 'string',
+        description: '可选：硬过滤，只保留命中这些路径 glob 之一的文件（逗号分隔，* 跨目录，如 *.rs）。',
+      },
+      exclude: {
+        type: 'string',
+        description: '可选：硬过滤，命中这些路径 glob 任一即排除（逗号分隔）。',
       },
     },
     output: {
@@ -167,6 +179,9 @@ export function apply(ctx: any): void {
       const cliArgs = ['search', '--root', root, '--query', String(args?.query ?? '')]
       if (args?.limit) cliArgs.push('--limit', String(args.limit))
       if (args?.astPattern) cliArgs.push('--ast-pattern', String(args.astPattern))
+      if (args?.kinds) cliArgs.push('--kinds', String(args.kinds))
+      if (args?.include) cliArgs.push('--include', String(args.include))
+      if (args?.exclude) cliArgs.push('--exclude', String(args.exclude))
 
       const result = await runEngine(binary, cliArgs, exec?.signal)
       return {

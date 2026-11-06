@@ -1128,12 +1128,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "relation-search"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "ast-grep-core",
  "ast-grep-language",
  "clap",
+ "globset",
  "jieba-rs",
  "serde",
  "serde_json",

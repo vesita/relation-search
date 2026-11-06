@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
@@ -158,7 +159,7 @@ pub struct Candidate {
     pub score: f64,
     pub snippet: String,
     pub source: String, // "bm25" 或 "ast"
-    pub kind: String,   // "code" | "test" | "doc" | "config" | "other"
+    pub kind: String,   // "code" | "test" | "doc" | "config" | "generated" | "other"
     pub symbol: String, // 所在一处定义的签名（尽力而为，可能为空）
 }
 
@@ -171,6 +172,79 @@ pub struct SearchJson {
     pub candidates: Vec<Candidate>,
 }
 
+/// 检索的硬过滤（与排序权重不同：不满足即排除，而非降权）。
+#[derive(Debug, Default, Clone)]
+pub struct Filter {
+    /// 只保留这些 kind（空 = 不按 kind 过滤）。
+    pub kinds: Vec<String>,
+    /// 路径 glob：给定时必须至少命中一个（空 = 不过滤）。
+    pub include: Vec<String>,
+    /// 路径 glob：命中任一即排除（空 = 不排除）。
+    pub exclude: Vec<String>,
+}
+
+impl Filter {
+    fn is_active(&self) -> bool {
+        !self.kinds.is_empty() || !self.include.is_empty() || !self.exclude.is_empty()
+    }
+}
+
+/// 编译后的过滤器（glob 只编译一次）。
+struct CompiledFilter {
+    kinds: Vec<String>,
+    include: Option<GlobSet>,
+    exclude: Option<GlobSet>,
+}
+
+impl CompiledFilter {
+    fn compile(filter: &Filter) -> Result<Self> {
+        const KNOWN_KINDS: &[&str] = &["code", "test", "doc", "config", "generated", "other"];
+        for kind in &filter.kinds {
+            if !KNOWN_KINDS.contains(&kind.as_str()) {
+                anyhow::bail!("未知的 kind: {kind}（可选：{}）", KNOWN_KINDS.join(" / "));
+            }
+        }
+        Ok(Self {
+            kinds: filter.kinds.clone(),
+            include: build_globset(&filter.include, "include")?,
+            exclude: build_globset(&filter.exclude, "exclude")?,
+        })
+    }
+
+    fn passes(&self, path: &str) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.iter().any(|k| k == classify_kind(path)) {
+            return false;
+        }
+        if let Some(include) = &self.include
+            && !include.is_match(path)
+        {
+            return false;
+        }
+        if let Some(exclude) = &self.exclude
+            && exclude.is_match(path)
+        {
+            return false;
+        }
+        true
+    }
+}
+
+fn build_globset(patterns: &[String], what: &str) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        // literal_separator(false)：`*` 可跨目录，符合「`*.rs` = 所有 rust 文件」的直觉。
+        let glob = GlobBuilder::new(pattern)
+            .literal_separator(false)
+            .build()
+            .with_context(|| format!("无效的 {what} glob 模式: {pattern}"))?;
+        builder.add(glob);
+    }
+    Ok(Some(builder.build().context("构建 glob 过滤器失败")?))
+}
+
 /// 使用 BM25 检索；索引不存在则先自动建索引；可选合并 ast-grep 命中。
 pub fn search_root(
     root: &Path,
@@ -178,6 +252,7 @@ pub fn search_root(
     query: &str,
     limit: usize,
     ast_pattern: Option<&str>,
+    filter: &Filter,
 ) -> Result<SearchJson> {
     let root_abs = root
         .canonicalize()
@@ -200,9 +275,13 @@ pub fn search_root(
     let reader = index.reader()?;
     let searcher = reader.searcher();
     let query_ast = build_query(content_f, query);
-    // 先按 BM25 多取一些（池），再做「文件类型权重 + 每文件上限」重排：
-    // 让实现代码压过近义的文档/配置，也不让单个大文件把候选位占满。
-    let pool = limit.saturating_mul(POOL_FACTOR).clamp(POOL_MIN, POOL_MAX);
+    // 有「硬过滤」时放宽候选池（过滤会丢很多），否则维持原池再做权重/每文件上限重排。
+    let compiled = CompiledFilter::compile(filter)?;
+    let pool = if filter.is_active() {
+        limit.saturating_mul(20).clamp(200, 2000)
+    } else {
+        limit.saturating_mul(POOL_FACTOR).clamp(POOL_MIN, POOL_MAX)
+    };
     let top = searcher.search(
         query_ast.as_ref(),
         &TopDocs::with_limit(pool).order_by_score(),
@@ -223,6 +302,9 @@ pub fn search_root(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let kind = classify_kind(&path);
+        if !compiled.passes(&path) {
+            continue;
+        }
         candidates.push(Candidate {
             score: f64::from(raw_score) * kind_weight(kind),
             kind: kind.to_string(),
@@ -239,7 +321,7 @@ pub fn search_root(
     let mut candidates = cap_per_file(candidates, PER_FILE_CAP, limit);
 
     if let Some(pattern) = ast_pattern {
-        candidates.extend(ast_candidates(&root_abs, pattern, limit));
+        candidates.extend(ast_candidates(&root_abs, pattern, limit, &compiled));
     }
 
     Ok(SearchJson {
@@ -292,7 +374,12 @@ fn build_query(content_f: Field, query: &str) -> Box<dyn Query> {
 
 /// 用内嵌 ast-grep（tree-sitter 语法已编入二进制）做结构搜索，无需外部 `sg`。
 /// 按文件扩展名判定语言；该语言不支持或 pattern 解析失败的文件跳过。
-fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate> {
+fn ast_candidates(
+    root: &Path,
+    pattern_src: &str,
+    limit: usize,
+    filter: &CompiledFilter,
+) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
     let root = match root.canonicalize() {
         Ok(r) => r,
@@ -321,6 +408,9 @@ fn ast_candidates(root: &Path, pattern_src: &str, limit: usize) -> Vec<Candidate
             .strip_prefix(&root)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .unwrap_or_default();
+        if !filter.passes(&rel) {
+            return Ok(());
+        }
         for m in root_node.find_all(pattern) {
             if out.len() >= limit {
                 break;
@@ -611,6 +701,37 @@ mod tests {
             kind: "code".to_string(),
             symbol: String::new(),
         }
+    }
+
+    #[test]
+    fn filter_kinds_and_globs() {
+        let by_kind = CompiledFilter::compile(&Filter {
+            kinds: vec!["code".to_string()],
+            include: vec![],
+            exclude: vec![],
+        })
+        .expect("compile");
+        assert!(by_kind.passes("src/a.rs"));
+        assert!(!by_kind.passes("docs/x.md"));
+
+        let by_glob = CompiledFilter::compile(&Filter {
+            kinds: vec![],
+            include: vec!["*.rs".to_string()],
+            exclude: vec!["tests/*".to_string()],
+        })
+        .expect("compile");
+        assert!(by_glob.passes("src/a.rs"), "*.rs 应跨目录匹配");
+        assert!(!by_glob.passes("src/a.py"));
+        assert!(!by_glob.passes("tests/a.rs"), "tests/* 应排除");
+
+        assert!(
+            CompiledFilter::compile(&Filter {
+                kinds: vec!["bogus".to_string()],
+                ..Default::default()
+            })
+            .is_err(),
+            "未知 kind 应报错"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use relation_search::engine::{default_index_dir, index_root, search_root};
+use relation_search::engine::{Filter, default_index_dir, index_root, search_root};
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +46,15 @@ enum Command {
         /// ast-grep 结构模式（已编入二进制，无需 PATH 中的 sg / ast-grep）
         #[arg(long, allow_hyphen_values = true)]
         ast_pattern: Option<String>,
+        /// 只保留这些文件类型 kind（逗号分隔：code/test/doc/config/generated/other）
+        #[arg(long, value_delimiter = ',')]
+        kinds: Option<Vec<String>>,
+        /// 路径 glob：只保留命中任一者（逗号分隔；`*` 可跨目录）
+        #[arg(long, value_delimiter = ',')]
+        include: Option<Vec<String>>,
+        /// 路径 glob：命中任一即排除（逗号分隔）
+        #[arg(long, value_delimiter = ',')]
+        exclude: Option<Vec<String>>,
     },
 }
 
@@ -72,12 +81,27 @@ fn run() -> Result<()> {
             query,
             limit,
             ast_pattern,
+            kinds,
+            include,
+            exclude,
         } => {
             let index_dir = match index_dir {
                 Some(d) => d,
                 None => default_index_dir(&root)?,
             };
-            let out = search_root(&root, &index_dir, &query, limit, ast_pattern.as_deref())?;
+            let filter = Filter {
+                kinds: kinds.unwrap_or_default(),
+                include: include.unwrap_or_default(),
+                exclude: exclude.unwrap_or_default(),
+            };
+            let out = search_root(
+                &root,
+                &index_dir,
+                &query,
+                limit,
+                ast_pattern.as_deref(),
+                &filter,
+            )?;
             println!("{}", serde_json::to_string(&out)?);
         }
     }
