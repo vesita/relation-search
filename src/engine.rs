@@ -411,9 +411,12 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
-/// 判断文件类型：代码 / 测试 / 文档 / 配置 / 其它。
-/// 目的：检索默认「代码优先」——文档与配置在实现检索里是噪声，应排在代码之后。
+/// 判断文件类型：代码 / 测试 / 文档 / 配置 / 生成物 / 其它。
+/// 目的：检索默认「代码优先」——文档、配置、编译产物在实现检索里是噪声，应排在源码之后。
 fn classify_kind(path: &str) -> &'static str {
+    if is_generated(path) {
+        return "generated";
+    }
     let lower = path.to_ascii_lowercase();
     let file = lower.rsplit('/').next().unwrap_or(&lower);
     let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
@@ -484,13 +487,29 @@ fn classify_kind(path: &str) -> &'static str {
     }
 }
 
-/// 文件类型对最终排序的权重：实现代码满分；文档/配置显著降权（仍可被召回，只是排在后面）。
+/// 编译/打包产物（不在 SKIP_DIRS 覆盖范围内的那些）：min/bundle/generated 后缀，
+/// 或 `/lib/` 目录下的 .js（插件 `tsc` 到 `lib/` 的产物）。它们是噪声，降权。
+fn is_generated(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let name_generated = file.ends_with(".min.js")
+        || file.ends_with(".bundle.js")
+        || file.ends_with(".generated.js")
+        || file.ends_with(".generated.ts")
+        || file.contains(".generated.");
+    let lib_js = lower.contains("/lib/")
+        && (file.ends_with(".js") || file.ends_with(".cjs") || file.ends_with(".mjs"));
+    name_generated || lib_js
+}
+
+/// 文件类型对最终排序的权重：实现代码满分；文档/配置/生成物显著降权（仍可被召回，只是排在后面）。
 fn kind_weight(kind: &str) -> f64 {
     match kind {
         "code" => 1.0,
         "test" => 0.85,
         "doc" => 0.30,
         "config" => 0.35,
+        "generated" => 0.15,
         _ => 0.60,
     }
 }
@@ -603,6 +622,8 @@ mod tests {
         assert_eq!(classify_kind("docs/BACKLOG.md"), "doc");
         assert_eq!(classify_kind("Cargo.toml"), "config");
         assert_eq!(classify_kind("README.md"), "doc");
+        assert_eq!(classify_kind("plugins/dsh-pod/lib/client.js"), "generated");
+        assert_eq!(classify_kind("web/app.min.js"), "generated");
     }
 
     #[test]
