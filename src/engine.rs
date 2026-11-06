@@ -35,7 +35,7 @@ const FILE_FIELD: &str = "file";
 const WRITER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
 
 /// 同一文件在一个结果集里最多保留的块数（防止单个大文件把候选位占满）。
-const PER_FILE_CAP: usize = 2;
+pub const DEFAULT_PER_FILE_CAP: usize = 2;
 
 /// 检索时先多取一些候选，再做「文件类型权重 + 每文件上限」重排的池大小系数/上下限。
 const POOL_FACTOR: usize = 6;
@@ -122,6 +122,15 @@ pub struct IndexSummary {
     pub index_dir: PathBuf,
 }
 
+/// 索引模式（`index --rebuild` 用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexMode {
+    /// 默认：索引目录里有匹配当前格式版本的清单时，只处理新增 / 修改 / 删除的文件。
+    Incremental,
+    /// 强制全量重建：忽略已有清单，安全删除索引目录后从头建索引。
+    Rebuild,
+}
+
 /// 索引清单：记录每个文件的内容哈希与块数，用于增量更新（无需每次整仓重建）。
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -150,6 +159,12 @@ struct FileEntry {
 
 const MANIFEST_FILE: &str = "manifest.json";
 
+/// 索引目录所有权标记文件（内容为 `{"formatVersion":N}`）：`index` 成功后写入。
+/// `--rebuild` 清理目录前用它确认「这是本工具生成的索引目录」；没有标记的目录还会
+/// 退一步检查「目录内是否全是 tantivy 索引产物」，只要混入非索引文件就拒绝删除，
+/// 避免 `--index-dir` 误指用户目录时删掉用户数据。
+const INDEX_MARKER_FILE: &str = ".relation-search-index";
+
 fn read_manifest(index_dir: &Path) -> Option<Manifest> {
     let text = std::fs::read_to_string(index_dir.join(MANIFEST_FILE)).ok()?;
     serde_json::from_str::<Manifest>(&text).ok()
@@ -162,25 +177,46 @@ fn write_manifest(index_dir: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
-/// 递归扫描 root、切块、写 tantivy 索引。
+/// 递归扫描 root、切块、写 tantivy 索引（默认增量模式）。
 ///
-/// **增量**：索引目录里有匹配当前 `INDEX_FORMAT_VERSION` 的 `manifest.json` 时，只对
-/// 「新增 / 修改 / 删除」的文件做 `delete_term + add_document`，不再整目录重建；
-/// 否则（首次、或格式版本不符）全量重建。无论哪种，重跑后索引都与当前源码保持一致。
+/// 保留旧签名以兼容既有调用方；等价于 [`IndexMode::Incremental`]。
 pub fn index_root(root: &Path, index_dir: &Path) -> Result<IndexSummary> {
+    index_root_with_mode(root, index_dir, IndexMode::Incremental)
+}
+
+/// 按指定模式建索引。
+///
+/// **增量**（默认）：索引目录里有匹配当前 `INDEX_FORMAT_VERSION` 的 `manifest.json` 时，
+/// 只对「新增 / 修改 / 删除」的文件做 `delete_term + add_document`，不再整目录重建；
+/// 否则（首次、或格式版本不符）全量重建。无论哪种，重跑后索引都与当前源码保持一致。
+///
+/// **重建**（`index --rebuild`）：忽略已有清单，改走「安全删除旧索引目录 + 从头建」，
+/// 用于索引损坏 / manifest 与实际不一致时强制自愈；删除前的安全校验见
+/// [`remove_index_dir`]，绝不删用户数据。
+pub fn index_root_with_mode(
+    root: &Path,
+    index_dir: &Path,
+    mode: IndexMode,
+) -> Result<IndexSummary> {
     let root = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
+    // 索引目录不能等于 root、也不能是 root 的祖先（否则重建会清掉仓库/用户数据）。
+    ensure_index_dir_is_usable(&root, index_dir)?;
 
     // 1) 判断能否增量：已有清单且格式版本匹配当前 INDEX_FORMAT_VERSION。
-    let old_manifest =
-        read_manifest(index_dir).filter(|m| m.format_version == INDEX_FORMAT_VERSION);
+    //    `Rebuild` 一律不走增量，强制全量重建。
+    let old_manifest = match mode {
+        IndexMode::Incremental => {
+            read_manifest(index_dir).filter(|m| m.format_version == INDEX_FORMAT_VERSION)
+        }
+        IndexMode::Rebuild => None,
+    };
     let incremental = old_manifest.is_some() && index_dir.join("meta.json").exists();
 
     if !incremental && index_dir.exists() {
-        // 全量重建：清理旧目录（首次或格式不兼容）。
-        std::fs::remove_dir_all(index_dir)
-            .with_context(|| format!("无法清理旧索引目录: {}", index_dir.display()))?;
+        // 全量重建：安全清理旧目录（首次 / 格式不兼容 / 显式 --rebuild）。
+        remove_index_dir(&root, index_dir)?;
     }
     std::fs::create_dir_all(index_dir)
         .with_context(|| format!("无法创建索引目录: {}", index_dir.display()))?;
@@ -213,6 +249,11 @@ pub fn index_root(root: &Path, index_dir: &Path) -> Result<IndexSummary> {
 
     // 3) 扫描当前文件：未变的沿用旧记录；新增/修改的先按 file 删旧块再写新块。
     for_each_text_file(&root, |path, content| {
+        // `--index-dir` 落在 root 内时，绝不把索引自身产物（meta.json / 段文件 / 标记文件）
+        // 当作源码再索引一遍。
+        if path.starts_with(&index_dir_abs) {
+            return Ok(());
+        }
         let rel = match path.strip_prefix(&root) {
             Ok(p) => p.to_string_lossy().replace('\\', "/"),
             Err(_) => return Ok(()),
@@ -268,11 +309,118 @@ pub fn index_root(root: &Path, index_dir: &Path) -> Result<IndexSummary> {
 
     let documents = new_manifest.files.values().map(|e| e.chunks).sum();
     write_manifest(&index_dir_abs, &new_manifest)?;
+    // 写所有权标记：供后续 `--rebuild` 安全识别「这是索引目录」，而不是用户数据目录。
+    write_index_marker(&index_dir_abs)?;
 
     Ok(IndexSummary {
         documents,
         index_dir: index_dir_abs,
     })
+}
+
+/// 写索引目录所有权标记（`formatVersion` 便于以后排查是哪个索引格式版本留下的目录）。
+fn write_index_marker(index_dir: &Path) -> Result<()> {
+    let marker = serde_json::json!({ "formatVersion": INDEX_FORMAT_VERSION });
+    std::fs::write(
+        index_dir.join(INDEX_MARKER_FILE),
+        serde_json::to_vec(&marker)?,
+    )
+    .with_context(|| format!("无法写入索引标记文件: {}", index_dir.display()))?;
+    Ok(())
+}
+
+/// 索引目录的基本合法性：存在时不能与 root 相同、也不能是 root 的祖先。
+/// （这两种情况下删索引或写索引都会直接波及仓库/用户数据。）
+fn ensure_index_dir_is_usable(root: &Path, index_dir: &Path) -> Result<()> {
+    if !index_dir.exists() {
+        return Ok(());
+    }
+    let index_abs = index_dir
+        .canonicalize()
+        .with_context(|| format!("无法规范化索引目录: {}", index_dir.display()))?;
+    if index_abs == root {
+        anyhow::bail!(
+            "索引目录不能与 root 相同（{}）：请换一个 --index-dir，否则会污染/清空仓库",
+            index_dir.display()
+        );
+    }
+    if root.starts_with(&index_abs) {
+        anyhow::bail!(
+            "索引目录不能是 root 的祖先目录（{} 包含 {}）：删除索引会波及仓库/用户数据",
+            index_dir.display(),
+            root.display()
+        );
+    }
+    Ok(())
+}
+
+/// 全量重建前安全删除索引目录：只删索引目录本身（不向上递归），且仅当它确实是
+/// 本工具管理的索引目录（空目录 / 带所有权标记 / 目录内全是 tantivy 索引产物）。
+/// 只要发现一个非索引文件就拒绝删除，避免 `--index-dir` 误指用户目录时造成数据丢失。
+fn remove_index_dir(root: &Path, index_dir: &Path) -> Result<()> {
+    let index_abs = index_dir
+        .canonicalize()
+        .with_context(|| format!("无法规范化索引目录: {}", index_dir.display()))?;
+    ensure_index_dir_is_usable(root, &index_abs)?;
+    if !is_managed_index_dir(&index_abs) {
+        anyhow::bail!(
+            "拒绝删除索引目录 {}：它不是 relation-search 的索引目录（缺少 {} 标记，或含非索引文件）。\
+             为避免误删用户数据，请确认 --index-dir 指向别处，或手动清理该目录后重试",
+            index_abs.display(),
+            INDEX_MARKER_FILE
+        );
+    }
+    std::fs::remove_dir_all(&index_abs)
+        .with_context(|| format!("无法清理旧索引目录: {}", index_abs.display()))?;
+    Ok(())
+}
+
+/// 目录是否可安全删除：空目录、带所有权标记，或「目录内全是 tantivy 索引产物且至少
+/// 含 meta.json / manifest.json」（兼容升级前没有标记文件的旧索引目录）。
+fn is_managed_index_dir(dir: &Path) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return false,
+    };
+    let mut any = false;
+    let mut saw_index_file = false;
+    for entry in entries.flatten() {
+        any = true;
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 有本工具的所有权标记 → 无条件信任（创建这个目录的就是索引器）。
+        if name == INDEX_MARKER_FILE {
+            return true;
+        }
+        if !is_index_artifact_name(&name) {
+            // 混入任何非索引文件 → 视为用户数据，不删。
+            return false;
+        }
+        if name == "meta.json" || name == MANIFEST_FILE {
+            saw_index_file = true;
+        }
+    }
+    // 空目录没有用户数据；否则必须是可识别的索引目录。
+    !any || saw_index_file
+}
+
+/// tantivy 索引目录里会出现的文件名（meta / 锁 / 清单 / 段文件）。
+fn is_index_artifact_name(name: &str) -> bool {
+    if name == "meta.json"
+        || name == MANIFEST_FILE
+        || name == ".managed.json"
+        || name == ".tantivy-meta.lock"
+        || name == ".tantivy-writer.lock"
+    {
+        return true;
+    }
+    // 段文件：`<segment-uuid>.<ext>`。
+    let Some((_, ext)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        ext,
+        "term" | "idx" | "pos" | "store" | "fast" | "fieldnorm" | "del"
+    )
 }
 
 /// 一条检索候选。
@@ -365,7 +513,43 @@ fn build_globset(patterns: &[String], what: &str) -> Result<Option<GlobSet>> {
     Ok(Some(builder.build().context("构建 glob 过滤器失败")?))
 }
 
+/// 检索选项：默认值等价于 0.2.10 的行为（8 条、代码优先、每文件最多 2 块）。
+#[derive(Debug, Clone)]
+pub struct SearchOptions {
+    /// 查询串。
+    pub query: String,
+    /// 返回条数上限。
+    pub limit: usize,
+    /// ast-grep 结构模式。
+    pub ast_pattern: Option<String>,
+    /// 硬过滤（kinds / include / exclude）。
+    pub filter: Filter,
+    /// 检索前先跑一次增量 `index`（`search --refresh`），保证结果反映当前磁盘内容。
+    pub refresh: bool,
+    /// 打分阶段是否乘 kind 权重；`false` 时 `score` 就是原始 BM25（`--no-kind-weight`）。
+    pub kind_weight: bool,
+    /// 每文件最多保留的块数；`None` = 不限制（`--no-per-file-cap`）。
+    pub per_file_cap: Option<usize>,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            query: String::new(),
+            limit: 8,
+            ast_pattern: None,
+            filter: Filter::default(),
+            refresh: false,
+            kind_weight: true,
+            per_file_cap: Some(DEFAULT_PER_FILE_CAP),
+        }
+    }
+}
+
 /// 使用 BM25 检索；索引不存在则先自动建索引；可选合并 ast-grep 命中。
+///
+/// 保留旧签名以兼容既有调用方；`--refresh` / `--no-kind-weight` / `--no-per-file-cap`
+/// 等开关见 [`SearchOptions`] 与 [`search_root_with_options`]。
 pub fn search_root(
     root: &Path,
     index_dir: &Path,
@@ -374,14 +558,31 @@ pub fn search_root(
     ast_pattern: Option<&str>,
     filter: &Filter,
 ) -> Result<SearchJson> {
+    let options = SearchOptions {
+        query: query.to_string(),
+        limit,
+        ast_pattern: ast_pattern.map(str::to_string),
+        filter: filter.clone(),
+        ..SearchOptions::default()
+    };
+    search_root_with_options(root, index_dir, &options)
+}
+
+/// 使用 BM25 检索；索引不存在（或 `refresh`）时先建/更新索引；可选合并 ast-grep 命中。
+pub fn search_root_with_options(
+    root: &Path,
+    index_dir: &Path,
+    options: &SearchOptions,
+) -> Result<SearchJson> {
     let root_abs = root
         .canonicalize()
         .with_context(|| format!("无法规范化 root 路径: {}", root.display()))?;
     // tantivy 的 TopDocs::with_limit 断言 limit>0；这里兜底成至少 1，避免 --limit 0 panic。
-    let limit = limit.max(1);
+    let limit = options.limit.max(1);
 
-    // 索引不存在（或不是有效 tantivy 索引）→ 自动建，方便插件即插即用。
-    if !index_dir.join("meta.json").exists() {
+    // 索引不存在（或不是有效 tantivy 索引）→ 自动建，方便插件即插即用；
+    // `--refresh` 则不管索引是否已存在，都先跑一次增量索引，把新增/修改/删除同步进来。
+    if options.refresh || !index_dir.join("meta.json").exists() {
         index_root(&root_abs, index_dir)?;
     }
 
@@ -399,13 +600,13 @@ pub fn search_root(
     let reader = index.reader()?;
     let searcher = reader.searcher();
     // 1) 内容查询（代码片段安全：分词后按词项 OR 召回，不用 QueryParser）。
-    let content_query = build_query(content_f, query);
+    let content_query = build_query(content_f, &options.query);
     // 2) kind 硬过滤下推到查询期：只对目标 kind 的子集做 BM25，避免「先取小池再后过滤」丢候选。
-    let query_ast: Box<dyn Query> = if filter.kinds.is_empty() {
+    let query_ast: Box<dyn Query> = if options.filter.kinds.is_empty() {
         content_query
     } else {
         let mut kind_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        for k in &filter.kinds {
+        for k in &options.filter.kinds {
             let term = Term::from_field_u64(kind_f, kind_id(k));
             kind_clauses.push((
                 Occur::Should,
@@ -423,9 +624,10 @@ pub fn search_root(
     // 3) 摘要生成器用最终查询（内部只收集 content 字段的词项）。
     let mut snippet_gen = SnippetGenerator::create(&searcher, query_ast.as_ref(), content_f)?;
     snippet_gen.set_max_num_chars(240);
-    let compiled = CompiledFilter::compile(filter)?;
+    let compiled = CompiledFilter::compile(&options.filter)?;
     // kind 已在查询期过滤；只有 include/exclude 这类路径后过滤需要放大候选池补偿。
-    let path_filter_active = !filter.include.is_empty() || !filter.exclude.is_empty();
+    let path_filter_active =
+        !options.filter.include.is_empty() || !options.filter.exclude.is_empty();
     let pool = if path_filter_active {
         limit.saturating_mul(20).clamp(200, 2000)
     } else {
@@ -433,21 +635,35 @@ pub fn search_root(
     };
     // 4) 收集阶段按 kind 权重加权（tweak_score 从 FAST 字段读 kind_id），
     //    使「代码优先」在加权分数上选 top-pool，而不是先按原始 BM25 取池再重排。
-    let collector = TopDocs::with_limit(pool).tweak_score(move |segment_reader: &SegmentReader| {
-        let kind_col = segment_reader
-            .fast_fields()
-            .u64(KIND_ID_FIELD)
-            .ok()
-            .map(|c| c.first_or_default_col(0));
-        move |doc: DocId, original_score: Score| -> f64 {
-            let weight = kind_col
-                .as_ref()
-                .map(|c| kind_weight_from_id(c.get_val(doc)))
-                .unwrap_or(1.0);
-            f64::from(original_score) * weight
-        }
-    });
-    let top = searcher.search(query_ast.as_ref(), &collector)?;
+    //    `--no-kind-weight` 时跳过加权：score 即原始 BM25，文件类型不再影响排序。
+    let top = if options.kind_weight {
+        let collector =
+            TopDocs::with_limit(pool).tweak_score(move |segment_reader: &SegmentReader| {
+                let kind_col = segment_reader
+                    .fast_fields()
+                    .u64(KIND_ID_FIELD)
+                    .ok()
+                    .map(|c| c.first_or_default_col(0));
+                move |doc: DocId, original_score: Score| -> f64 {
+                    let weight = kind_col
+                        .as_ref()
+                        .map(|c| kind_weight_from_id(c.get_val(doc)))
+                        .unwrap_or(1.0);
+                    f64::from(original_score) * weight
+                }
+            });
+        searcher.search(query_ast.as_ref(), &collector)?
+    } else {
+        searcher
+            .search(
+                query_ast.as_ref(),
+                &TopDocs::with_limit(pool).order_by_score(),
+            )?
+            .into_iter()
+            // `order_by_score` 的 Fruit 用 f32；统一成 f64，与加权分支的最终分类型一致。
+            .map(|(score, addr)| (f64::from(score), addr))
+            .collect()
+    };
 
     let mut candidates: Vec<Candidate> = Vec::with_capacity(top.len());
     for (raw_score, addr) in top {
@@ -468,7 +684,8 @@ pub fn search_root(
             continue;
         }
         candidates.push(Candidate {
-            // raw_score 已是 tweak_score 加权后的最终分（含 kind 权重）。
+            // 默认 raw_score 是 tweak_score 加权后的最终分（含 kind 权重）；
+            // `--no-kind-weight` 时是原始 BM25。
             score: raw_score,
             kind: kind.to_string(),
             symbol: extract_symbol(content),
@@ -486,7 +703,7 @@ pub fn search_root(
     // - 同一文件里与已有 BM25 候选行区间重叠的 AST 命中跳过（避免重复展示同一段代码）；
     // - 其余 AST 命中给一个「略低于最弱 BM25 候选」的基础分（BM25 为空时给 0），
     //   使其能进榜且排序稳定，但不会压过内容命中；最后统一 cap_per_file + 截断到 limit。
-    if let Some(pattern) = ast_pattern {
+    if let Some(pattern) = options.ast_pattern.as_deref() {
         let ast = ast_candidates(&root_abs, pattern, limit, &compiled);
         let base = candidates
             .last()
@@ -510,10 +727,14 @@ pub fn search_root(
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
     }
 
-    let candidates = cap_per_file(candidates, PER_FILE_CAP, limit);
+    let candidates = match options.per_file_cap {
+        Some(per_file) => cap_per_file(candidates, per_file, limit),
+        // `--no-per-file-cap`：只按 limit 截断，不再压每文件块数。
+        None => candidates.into_iter().take(limit).collect(),
+    };
 
     Ok(SearchJson {
-        query: query.to_string(),
+        query: options.query.clone(),
         root: root_abs.to_string_lossy().to_string(),
         count: candidates.len(),
         candidates,
