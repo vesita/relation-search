@@ -22,7 +22,7 @@ use ast_grep_core::Pattern;
 use ast_grep_language::{Language, LanguageExt, SupportLang};
 
 use crate::chunk::{chunk_text, for_each_text_file};
-use crate::tokenizer::{TOKENIZER_NAME, build_analyzer, tokenize_to_strings};
+use crate::tokenizer::{TOKENIZER_NAME, build_analyzer, has_cjk, tokenize_to_strings};
 
 const PATH_FIELD: &str = "path";
 const START_FIELD: &str = "start_line";
@@ -447,6 +447,17 @@ pub struct Candidate {
     pub symbol: String, // 所在一处定义的签名（尽力而为，可能为空）
 }
 
+/// 候选池里的一项：`snippet` 延迟到「进入最终结果」时再生。
+///
+/// tantivy 的 `SnippetGenerator` 会重新分词整块正文；中文正文会触发 jieba 词典加载
+/// （约 60ms）并按篇切词。候选池默认 ≥40 篇，若在池阶段逐篇生成，纯 ASCII 查询也会
+/// 被拖进 jieba，实测 4ms → 70ms。故池阶段只保留正文，最终 top-limit 时才生成。
+struct PendingCandidate {
+    candidate: Candidate,
+    /// 待补 snippet 的块正文；AST 命中自带 snippet，这里为 None。
+    content: Option<String>,
+}
+
 /// search 命令的 stdout JSON 结构。
 #[derive(Debug, Serialize)]
 pub struct SearchJson {
@@ -684,7 +695,7 @@ pub fn search_root_with_options(
             .collect()
     };
 
-    let mut candidates: Vec<Candidate> = Vec::with_capacity(top.len());
+    let mut candidates: Vec<PendingCandidate> = Vec::with_capacity(top.len());
     for (raw_score, addr) in top {
         let doc: TantivyDocument = searcher.doc(addr)?;
         let path = doc
@@ -702,21 +713,24 @@ pub fn search_root_with_options(
         if !compiled.passes(&path) {
             continue;
         }
-        candidates.push(Candidate {
-            // 默认 raw_score 是 tweak_score 加权后的最终分（含 kind 权重）；
-            // `--no-kind-weight` 时是原始 BM25。
-            score: raw_score,
-            kind: kind.to_string(),
-            symbol: extract_symbol(content),
-            path,
-            start_line,
-            end_line,
-            snippet: snippet_text(&snippet_gen, content),
-            source: "bm25".to_string(),
+        candidates.push(PendingCandidate {
+            candidate: Candidate {
+                // 默认 raw_score 是 tweak_score 加权后的最终分（含 kind 权重）；
+                // `--no-kind-weight` 时是原始 BM25。
+                score: raw_score,
+                kind: kind.to_string(),
+                symbol: extract_symbol(content),
+                path,
+                start_line,
+                end_line,
+                snippet: String::new(), // 池阶段不生成，最终候选才生成
+                source: "bm25".to_string(),
+            },
+            content: Some(content.to_string()),
         });
     }
     // 权重已并入 score；先按 score 降序（BM25 结果）。
-    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
 
     // 可选：ast-grep 结构召回。与 BM25 做「去重 + 融合」而不是无脑 append：
     // - 同一文件里与已有 BM25 候选行区间重叠的 AST 命中跳过（避免重复展示同一段代码）；
@@ -726,31 +740,59 @@ pub fn search_root_with_options(
         let ast = ast_candidates(&root_abs, pattern, limit, &compiled);
         let base = candidates
             .last()
-            .map(|c| c.score)
+            .map(|c| c.candidate.score)
             .filter(|s| *s > 0.0)
             .map(|s| s * 0.5)
             .unwrap_or(0.0);
         let mut added = 0usize;
         for mut a in ast {
             let overlaps = candidates.iter().any(|c| {
-                c.path == a.path
-                    && ranges_overlap(c.start_line, c.end_line, a.start_line, a.end_line)
+                c.candidate.path == a.path
+                    && ranges_overlap(
+                        c.candidate.start_line,
+                        c.candidate.end_line,
+                        a.start_line,
+                        a.end_line,
+                    )
             });
             if overlaps {
                 continue;
             }
             a.score = (base - (added as f64) * 1e-6).max(0.0);
-            candidates.push(a);
+            candidates.push(PendingCandidate {
+                candidate: a,
+                content: None,
+            });
             added += 1;
         }
-        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
     }
 
-    let candidates = match options.per_file_cap {
-        Some(per_file) => cap_per_file(candidates, per_file, limit),
+    let mut candidates = match options.per_file_cap {
+        Some(per_file) => cap_per_file(candidates, per_file, limit, |c| {
+            c.candidate.path.as_str()
+        }),
         // `--no-per-file-cap`：只按 limit 截断，不再压每文件块数。
         None => candidates.into_iter().take(limit).collect(),
     };
+
+    // snippet 只为最终候选生成（见 PendingCandidate 注释）。
+    // 另：纯 ASCII 查询 + CJK 正文时，改用「定位查询词窗口」的廉价实现——此时
+    // SnippetGenerator 的唯一作用也是找同一个词，却会把 jieba 词典加载进来。
+    let query_has_cjk = has_cjk(options.query.as_str());
+    let candidates: Vec<Candidate> = candidates
+        .drain(..)
+        .map(|mut pending| {
+            if let Some(content) = pending.content.take() {
+                pending.candidate.snippet = if !query_has_cjk && has_cjk(&content) {
+                    cheap_snippet(&content, &options.query)
+                } else {
+                    snippet_text(&snippet_gen, &content)
+                };
+            }
+            pending.candidate
+        })
+        .collect();
 
     Ok(SearchJson {
         query: options.query.clone(),
@@ -868,6 +910,55 @@ fn snippet_text(generator: &SnippetGenerator, content: &str) -> String {
     } else {
         fragment.to_string()
     }
+}
+
+/// 廉价摘要：按查询词在正文里的首个出现位置取一个 ~240 字符窗口。
+///
+/// 用于「纯 ASCII 查询 + CJK 正文」：此时走 `SnippetGenerator` 会为分词 CJK 正文触发
+/// jieba 初始化（约 60ms），而它要做的也只是定位同样的查询词，用不着词典。
+fn cheap_snippet(content: &str, query: &str) -> String {
+    for token in tokenize_to_strings(query) {
+        if let Some(pos) = find_ci(content, &token) {
+            return window_around(content, pos, 240, 80);
+        }
+    }
+    truncate_chars(content, 240)
+}
+
+/// 大小写不敏感查找，返回在 hay 里的字节位置。
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    hay.to_lowercase().find(&needle.to_lowercase())
+}
+
+/// 以 pos 为中心向前 back 字节起、总长约 len 字节取窗口（对齐 UTF-8 边界）。
+fn window_around(content: &str, pos: usize, len: usize, back: usize) -> String {
+    let start = floor_char_boundary(content, pos.saturating_sub(back));
+    let end = ceil_char_boundary(content, start.saturating_add(len));
+    content[start..end].to_string()
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i > s.len() {
+        i = s.len();
+    }
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
+    let n = s.len();
+    if i >= n {
+        return n;
+    }
+    while i < n && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn truncate_chars(s: &str, n: usize) -> String {
@@ -1012,14 +1103,17 @@ fn ranges_overlap(a1: u64, a2: u64, b1: u64, b2: u64) -> bool {
 }
 
 /// 按「每文件最多 per_file 块」过滤并截断到 limit 条；在已按 score 排序的前提下使用。
-fn cap_per_file(items: Vec<Candidate>, per_file: usize, limit: usize) -> Vec<Candidate> {
+fn cap_per_file<T, F>(items: Vec<T>, per_file: usize, limit: usize, path_of: F) -> Vec<T>
+where
+    F: for<'a> Fn(&'a T) -> &'a str,
+{
     let mut per: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::with_capacity(limit.min(items.len()));
     for item in items {
         if out.len() >= limit {
             break;
         }
-        let seen = per.entry(item.path.clone()).or_insert(0);
+        let seen = per.entry(path_of(&item).to_string()).or_insert(0);
         if *seen < per_file {
             *seen += 1;
             out.push(item);
@@ -1179,9 +1273,24 @@ mod tests {
             cand("a.rs", 7.0),
             cand("b.rs", 6.0),
         ];
-        let out = cap_per_file(items, 2, 10);
+        let out = cap_per_file(items, 2, 10, |c| c.path.as_str());
         assert_eq!(out.len(), 3);
         assert_eq!(out.iter().filter(|c| c.path == "a.rs").count(), 2);
+    }
+
+    #[test]
+    fn cheap_snippet_centers_on_ascii_token() {
+        let mut content = String::from("中文注释行\n");
+        content.push_str(&"填充文本。".repeat(80));
+        content.push_str("\nfn user_profile_cache() {}\n");
+        let snip = cheap_snippet(&content, "user_profile_cache");
+        assert!(snip.to_lowercase().contains("user_profile_cache"));
+        assert!(snip.chars().count() <= 240);
+    }
+
+    #[test]
+    fn cheap_snippet_falls_back_to_head() {
+        assert_eq!(cheap_snippet("hello world", "zzz_nomatch"), "hello world");
     }
 
     /// 索引目录被别的进程占用（tantivy writer 排他锁）时，`--refresh` 不能把检索弄死：

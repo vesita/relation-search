@@ -40,6 +40,11 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+/// 文本里是否含 CJK 字符。用于判断「是否值得为摘要生成触发 jieba 初始化」。
+pub(crate) fn has_cjk(text: &str) -> bool {
+    text.chars().any(is_cjk)
+}
+
 /// 把一段原文切成 token 列表（位置 position 全局递增，offset 用真实字节偏移）。
 fn tokenize_code(text: &str) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
@@ -270,5 +275,13 @@ mod tests {
         assert!(toks(&too_long).is_empty(), ">64 的 token 应被过滤");
         let ok = "a".repeat(60);
         assert_eq!(toks(&ok), vec![ok]);
+    }
+
+    #[test]
+    fn has_cjk_detects_chinese_only() {
+        assert!(has_cjk("用户资料缓存"));
+        assert!(has_cjk("mixed 用户"));
+        assert!(!has_cjk("user_profile_cache"));
+        assert!(!has_cjk("café"));
     }
 }

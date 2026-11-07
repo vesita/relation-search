@@ -1,6 +1,6 @@
 [package]
 name = "relation-search"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2024"
 description = "代码检索：tantivy BM25 + 代码感知分词 + 内嵌 ast-grep 结构召回（无需外部工具）"
 repository = "https://github.com/vesita/relation-search"
