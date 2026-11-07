@@ -22,15 +22,31 @@ fn unique_tmp(tag: &str) -> PathBuf {
 }
 
 fn run(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(bin())
-        .args(args)
-        .output()
-        .expect("启动二进制失败");
+    run_with_env(args, &[])
+}
+
+fn run_with_env(args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
+    let mut command = Command::new(bin());
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let out = command.output().expect("启动二进制失败");
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     )
+}
+
+/// 与引擎相同的 FNV-1a 64 位哈希：测试里用来伪造 manifest「文件未变化」的过期状态。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn parse_single_json(stdout: &str) -> Value {
@@ -224,6 +240,64 @@ fn code_like_queries_do_not_error_and_still_match() {
     let _ = std::fs::remove_dir_all(&index_dir);
 }
 
+/// 增量索引：同一个 index-dir 重复 index 时，应正确处理「未变 / 修改 / 新增 / 删除」，
+/// 保证索引与当前源码一致，而不是依赖整目录重建。
+#[test]
+fn incremental_index_reflects_changes() {
+    let fixture = unique_tmp("inc-fixture");
+    let index_dir = unique_tmp("inc-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    let a = fixture.join("a.rs");
+    let b = fixture.join("b.rs");
+    // 三个互不共享词项的标识符（无 camel 边界，整体一个 token），便于精确判断命中变化。
+    write(&a, "fn aardvarktoken() {}\n");
+
+    let index_docs = |expect: u64| {
+        let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+        assert_eq!(code, 0, "index 失败: {stderr}");
+        let j = parse_single_json(&stdout);
+        assert_eq!(
+            j["documents"],
+            Value::from(expect),
+            "documents 不符: stdout={stdout}"
+        );
+    };
+    let count_for = |q: &str| -> u64 {
+        let (code, stdout, _) = run(&["search", "--root", &fs, "--index-dir", &is, "--query", q]);
+        assert_eq!(code, 0);
+        parse_single_json(&stdout)["count"].as_u64().unwrap()
+    };
+
+    // 首次：1 个块。
+    index_docs(1);
+    assert!(count_for("aardvarktoken") > 0, "初始应命中 a.rs");
+
+    // 修改 a.rs 内容：重跑应替换旧块（旧词消失、新词命中），docs 仍为 1。
+    write(&a, "fn buffalotoken() {}\n");
+    index_docs(1);
+    assert_eq!(count_for("aardvarktoken"), 0, "修改后旧词应不再命中");
+    assert!(count_for("buffalotoken") > 0, "修改后新词应命中");
+
+    // 新增 b.rs：docs 变 2。
+    write(&b, "fn cheetahtoken() {}\n");
+    index_docs(2);
+    assert!(count_for("cheetahtoken") > 0, "新增文件应命中");
+
+    // 未变再跑：docs 仍 2。
+    index_docs(2);
+
+    // 删除 b.rs：docs 回 1，其词不再命中。
+    std::fs::remove_file(&b).unwrap();
+    index_docs(1);
+    assert_eq!(count_for("cheetahtoken"), 0, "删除文件应不再命中");
+    assert!(count_for("buffalotoken") > 0, "保留文件应仍命中");
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
 /// 回归：ast-grep 模式按语言缓存后，结构召回仍应命中。
 #[test]
 fn ast_pattern_still_matches() {
@@ -258,6 +332,344 @@ fn ast_pattern_still_matches() {
             .iter()
             .any(|c| c["source"] == "ast" && c["path"].as_str().unwrap_or("").ends_with("lib.rs")),
         "ast 结构召回应命中 lib.rs"
+    );
+    // 融合后不应超过 limit（默认 8），也不会把 AST 结果无脑追加到 limit 之外。
+    assert!(
+        cands.len() <= 8,
+        "结果数不应超过 limit，实际 {}",
+        cands.len()
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// `search --refresh`：检索前先跑一次增量 index，能搜到「已建索引之后新增的文件」。
+/// 反向对照：不加 --refresh 时同一索引不会自动更新，新文件搜不到（证明该标志真的起作用）。
+#[test]
+fn search_refresh_indexes_new_files_before_search() {
+    let fixture = unique_tmp("refresh-fixture");
+    let index_dir = unique_tmp("refresh-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    let a = fixture.join("a.rs");
+    write(&a, "fn aardvarktoken() {}\n");
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    // 建索引之后再新增文件，但不重跑 index。
+    write(&fixture.join("b.rs"), "fn buffalotoken() {}\n");
+
+    let count_for = |query: &str, extra: &[&str]| -> u64 {
+        let mut args = vec![
+            "search",
+            "--root",
+            fs.as_str(),
+            "--index-dir",
+            is.as_str(),
+            "--query",
+            query,
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 0, "search 失败 query={query:?}: {stderr}");
+        parse_single_json(&stdout)["count"].as_u64().unwrap()
+    };
+
+    // 反向对照：没有 --refresh 时索引不更新 → 新增文件搜不到。
+    assert_eq!(
+        count_for("buffalotoken", &[]),
+        0,
+        "未加 --refresh 时不应自动索引新文件"
+    );
+
+    // --refresh：检索前先增量 index → 新增文件可检索，旧文件仍在。
+    assert!(
+        count_for("buffalotoken", &["--refresh"]) > 0,
+        "--refresh 应先把新增文件索引进来"
+    );
+    assert!(
+        count_for("aardvarktoken", &["--refresh"]) > 0,
+        "--refresh 后旧文件仍应命"
+    );
+
+    // --refresh 也同步「修改」：改内容后立刻能搜到新词。
+    write(&a, "fn camelotoken() {}\n");
+    assert!(
+        count_for("camelotoken", &["--refresh"]) > 0,
+        "--refresh 应同步被修改的文件内容"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// `index --rebuild`：即使 manifest 被伪造/损坏、增量路径误以为「文件未变化」，
+/// 也强制丢弃旧索引并从当前源码重建（旧词消失、新词可检索）。
+#[test]
+fn index_rebuild_forces_full_rebuild() {
+    let fixture = unique_tmp("rebuild-fixture");
+    let index_dir = unique_tmp("rebuild-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    let a = fixture.join("a.rs");
+    write(&a, "fn aardvarktoken() {}\n");
+    let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "首次 index 失败: {stderr}");
+    assert_eq!(parse_single_json(&stdout)["documents"], Value::from(1u64));
+
+    // 改源码，并伪造 manifest 里 a.rs 的记录为「与新内容一样」：模拟索引损坏 /
+    // manifest 与实际不一致。此时增量 index 会信任 manifest，保持旧索引不动。
+    write(&a, "fn buffalotoken() {}\n");
+    let new_content = std::fs::read(&a).unwrap();
+    let manifest_path = index_dir.join("manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("读不到 manifest"))
+            .expect("manifest 不是合法 JSON");
+    manifest["files"]["a.rs"]["size"] = Value::from(new_content.len() as u64);
+    manifest["files"]["a.rs"]["hash"] = Value::from(fnv1a64(&new_content));
+    std::fs::write(&manifest_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+
+    let count_for = |query: &str| -> u64 {
+        let (code, stdout, stderr) = run(&[
+            "search",
+            "--root",
+            fs.as_str(),
+            "--index-dir",
+            is.as_str(),
+            "--query",
+            query,
+        ]);
+        assert_eq!(code, 0, "search 失败 query={query:?}: {stderr}");
+        parse_single_json(&stdout)["count"].as_u64().unwrap()
+    };
+
+    // 反向对照：普通（增量）index 被伪造的 manifest 骗过，索引仍是旧内容。
+    let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "增量 index 失败: {stderr}");
+    assert_eq!(parse_single_json(&stdout)["documents"], Value::from(1u64));
+    assert!(
+        count_for("aardvarktoken") > 0,
+        "反向对照：增量 index 信任 manifest，应暂时仍能搜到旧内容"
+    );
+    assert_eq!(
+        count_for("buffalotoken"),
+        0,
+        "反向对照：增量 index 信任 manifest，应暂时搜不到新内容"
+    );
+
+    // --rebuild：忽略清单，真正全量重建。旧内容必须消失、新内容必须可检索。
+    let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is, "--rebuild"]);
+    assert_eq!(code, 0, "--rebuild 失败: {stderr}");
+    let j = parse_single_json(&stdout);
+    assert_eq!(j["ok"], Value::Bool(true));
+    assert_eq!(j["documents"], Value::from(1u64), "重建后仍是 1 个块");
+    assert_eq!(count_for("aardvarktoken"), 0, "--rebuild 后旧内容应消失");
+    assert!(count_for("buffalotoken") > 0, "--rebuild 后新内容应可检索");
+
+    // 再次 --rebuild：索引目录里已有所有权标记，应仍被安全识别并重建成功。
+    let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is, "--rebuild"]);
+    assert_eq!(code, 0, "第二次 --rebuild 失败: {stderr}");
+    assert_eq!(parse_single_json(&stdout)["documents"], Value::from(1u64));
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// `index --rebuild` 的安全边界：只删本工具管理的索引目录。
+/// - `--index-dir` 指向含用户文件的目录 → 拒绝，文件原样保留；
+/// - `--index-dir` 等于 root → 拒绝，仓库文件原样保留；
+/// - 默认索引目录（哈希规则）下 --rebuild 正常工作，且会写入所有权标记。
+#[test]
+fn index_rebuild_never_deletes_user_data() {
+    let fixture = unique_tmp("safe-fixture");
+    let fs = fixture.to_string_lossy().to_string();
+    write(&fixture.join("a.rs"), "fn safetoken() {}\n");
+
+    // 1) 用户数据目录：不能删、不能覆盖、必须报错。
+    let user_dir = unique_tmp("safe-user");
+    let user_s = user_dir.to_string_lossy().to_string();
+    let user_file = user_dir.join("notes.txt");
+    write(&user_file, "irreplaceable user data\n");
+    let (code, stdout, stderr) =
+        run(&["index", "--root", &fs, "--index-dir", &user_s, "--rebuild"]);
+    assert_ne!(code, 0, "--rebuild 不应接受含用户文件的目录");
+    assert!(stdout.trim().is_empty(), "出错时 stdout 应为空");
+    assert!(!stderr.trim().is_empty(), "出错时 stderr 应有原因");
+    assert!(user_file.exists(), "用户文件绝不能被删除");
+    assert_eq!(
+        std::fs::read_to_string(&user_file).unwrap(),
+        "irreplaceable user data\n",
+        "用户文件内容不能被改动"
+    );
+
+    // 2) 索引目录 == root：拒绝，不能把仓库当索引删掉。
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &fs, "--rebuild"]);
+    assert_ne!(code, 0, "--rebuild 不应接受 index-dir == root");
+    assert!(!stderr.trim().is_empty());
+    assert!(fixture.join("a.rs").exists(), "root 里的源码绝不能被删除");
+
+    // 3) 默认索引目录（`${RELATION_SEARCH_CACHE_DIR}/<root 哈希>`）下 --rebuild 可用。
+    let cache = unique_tmp("safe-cache");
+    let cache_s = cache.to_string_lossy().to_string();
+    let cache_env: &[(&str, &str)] = &[("RELATION_SEARCH_CACHE_DIR", cache_s.as_str())];
+    for round in 1..=2 {
+        let (code, stdout, stderr) =
+            run_with_env(&["index", "--root", &fs, "--rebuild"], cache_env);
+        assert_eq!(
+            code, 0,
+            "第 {round} 次默认索引目录 --rebuild 失败: {stderr}"
+        );
+        assert_eq!(parse_single_json(&stdout)["documents"], Value::from(1u64));
+    }
+    // 默认索引目录里应写入所有权标记（供下次 --rebuild 安全识别）。
+    let marked = std::fs::read_dir(&cache)
+        .expect("缓存目录不存在")
+        .flatten()
+        .any(|entry| entry.path().join(".relation-search-index").exists());
+    assert!(marked, "默认索引目录应写入所有权标记文件");
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&user_dir);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+/// `search --no-kind-weight`：关闭 kind 权重后，同内容块的分数只由 BM25 决定。
+/// 正向：默认 doc 被乘 0.30 权重，分数显著低于 code；
+/// 反向：--no-kind-weight 时两者分数相等（证明权重确实被关掉）。
+#[test]
+fn search_no_kind_weight_disables_kind_bias() {
+    let fixture = unique_tmp("noweight-fixture");
+    let index_dir = unique_tmp("noweight-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    // 两份文件内容完全相同 → 原始 BM25 分数相同，差异只可能来自 kind 权重。
+    let body = "pub fn rankingtoken() {}\n";
+    write(&fixture.join("src/impl.rs"), body);
+    write(&fixture.join("docs/notes.md"), body);
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    let search = |extra: &[&str]| -> Value {
+        let mut args = vec![
+            "search",
+            "--root",
+            fs.as_str(),
+            "--index-dir",
+            is.as_str(),
+            "--query",
+            "rankingtoken",
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 0, "search 失败: {stderr}");
+        parse_single_json(&stdout)
+    };
+    let score_of = |j: &Value, suffix: &str| -> f64 {
+        j["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["path"].as_str().unwrap_or("").ends_with(suffix))
+            .unwrap_or_else(|| panic!("结果里应包含 {suffix}: {j}"))["score"]
+            .as_f64()
+            .unwrap()
+    };
+
+    // 默认：code 满分、doc 被降权 → code 分数更高且排第一。
+    let weighted = search(&[]);
+    assert_eq!(weighted["count"], Value::from(2u64));
+    let code_score = score_of(&weighted, "impl.rs");
+    let doc_score = score_of(&weighted, "notes.md");
+    assert!(
+        code_score > doc_score,
+        "默认应 code 优先: code={code_score}, doc={doc_score}"
+    );
+    assert!(
+        weighted["candidates"][0]["path"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("impl.rs"),
+        "默认排序 code 应排第一: {weighted}"
+    );
+
+    // --no-kind-weight：两份文件原始 BM25 相同 → 分数相等，不再有 doc 降权。
+    let unweighted = search(&["--no-kind-weight"]);
+    assert_eq!(unweighted["count"], Value::from(2u64));
+    let code_score2 = score_of(&unweighted, "impl.rs");
+    let doc_score2 = score_of(&unweighted, "notes.md");
+    assert!(
+        (code_score2 - doc_score2).abs() < 1e-9,
+        "--no-kind-weight 后同内容块分数应相等: code={code_score2}, doc={doc_score2}"
+    );
+    assert!(
+        doc_score2 > doc_score,
+        "关闭权重后 doc 分数应回到原始 BM25（高于被降权的 {doc_score}）"
+    );
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// `search --no-per-file-cap`：默认同一文件最多保留 2 块；关闭后应能列出更多块。
+#[test]
+fn search_no_per_file_cap_keeps_more_chunks() {
+    let fixture = unique_tmp("nocap-fixture");
+    let index_dir = unique_tmp("nocap-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    // 4 个段落，每段 62 行（> 60 行软上限）→ 切出 4 个块，每块都含 sharedtoken。
+    let mut content = String::new();
+    for group in 0..4 {
+        for i in 0..61 {
+            content.push_str(&format!("let filler{group}_{i} = {i};\n"));
+        }
+        content.push_str("fn sharedtoken() {}\n");
+        content.push('\n');
+    }
+    write(&fixture.join("src/many.rs"), &content);
+    let (code, stdout, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+    assert_eq!(
+        parse_single_json(&stdout)["documents"],
+        Value::from(4u64),
+        "fixture 应切成 4 块"
+    );
+
+    let search = |extra: &[&str]| -> Value {
+        let mut args = vec![
+            "search",
+            "--root",
+            fs.as_str(),
+            "--index-dir",
+            is.as_str(),
+            "--query",
+            "sharedtoken",
+            "--limit",
+            "8",
+        ];
+        args.extend_from_slice(extra);
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 0, "search 失败: {stderr}");
+        parse_single_json(&stdout)
+    };
+
+    let capped = search(&[]);
+    assert_eq!(
+        capped["count"],
+        Value::from(2u64),
+        "默认每文件最多 2 块: {capped}"
+    );
+
+    let uncapped = search(&["--no-per-file-cap"]);
+    assert_eq!(
+        uncapped["count"],
+        Value::from(4u64),
+        "--no-per-file-cap 后 4 块都应返回: {uncapped}"
     );
 
     let _ = std::fs::remove_dir_all(&fixture);

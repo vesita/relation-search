@@ -12,7 +12,8 @@
  *   3. 仓库开发态 `../../target/release/relation-search`；
  *   4. 退回 PATH 里的 `relation-search`。
  *
- * 首次对一个 root 检索时自动建索引（引擎的 `index` 子命令），之后复用缓存索引目录。
+ * 每次检索前都会先跑一次增量 `index`（未变化的文件几乎瞬时），保证结果反映当前源码，
+ * 而不是「同一进程只建一次索引、会话内改了代码仍读旧结果」。
  * 索引目录由引擎按 `${RELATION_SEARCH_CACHE_DIR:-$HOME/.cache/relation-search}/<root 哈希>` 决定。
  */
 
@@ -95,9 +96,6 @@ function renderText(args: any, value: any): string {
 }
 
 export function apply(ctx: any): void {
-  /** 每个 root 只自动建一次索引（同一插件实例内）。 */
-  const indexedRoots = new Set<string>()
-
   const codeReuseSearchTool = defineTool({
     name: 'relation_search',
     description:
@@ -171,10 +169,9 @@ export function apply(ctx: any): void {
       root = resolve(root)
       const binary = resolveBinary()
 
-      if (!indexedRoots.has(root)) {
-        await runEngine(binary, ['index', '--root', root], exec?.signal)
-        indexedRoots.add(root)
-      }
+      // 每次检索前做一次增量 index：只处理新增/修改/删除的文件（未变文件几乎瞬时），
+      // 既保证 root 首次可用，也保证会话内改动的代码能被搜到。
+      await runEngine(binary, ['index', '--root', root], exec?.signal)
 
       const cliArgs = ['search', '--root', root, '--query', String(args?.query ?? '')]
       if (args?.limit) cliArgs.push('--limit', String(args.limit))
