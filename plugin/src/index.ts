@@ -73,9 +73,9 @@ function runEngine(binary: string, args: string[], signal?: AbortSignal): Promis
 /** 把工具结果渲染成模型可读的文本。 */
 function renderText(args: any, value: any): string {
   const count = Number(value?.count ?? 0)
-  const lines: string[] = [`复用检索：${String(args?.query ?? '')}（${count} 个候选，root=${String(value?.root ?? '')}）`]
+  const lines: string[] = [`复用检索：${String(args?.query ?? '')}（${count} 个候选）`]
   if (count === 0) {
-    lines.push('未找到相似旧实现。若确为新功能，按 search-before-implement 在决策记录里写明"无可用旧实现"。')
+    lines.push('未找到相似旧实现；若确为新功能，在决策记录里写明「无可用旧实现」。')
     return lines.join('\n')
   }
   const candidates: any[] = Array.isArray(value?.candidates) ? value.candidates : []
@@ -91,7 +91,7 @@ function renderText(args: any, value: any): string {
     lines.push('```')
   })
   lines.push('')
-  lines.push('逐条判定：直接复用 / 改造复用 / 不复用（不复用写清具体差异，指到 文件:行）。')
+  lines.push('判定：直接复用 / 改造复用 / 不复用（写明差异与 文件:行）。')
   return lines.join('\n')
 }
 
@@ -113,10 +113,9 @@ function aggregate(candidates: any[]): Map<string, { hits: number; best: number;
 function renderSummary(args: any, value: any): string {
   const count = Number(value?.count ?? 0)
   const documents = Number(value?.documents ?? 0)
-  const root = String(value?.root ?? '')
   const head = `复用检索：${String(args?.query ?? '')}（扫描 ${documents > 0 ? documents : '?'} 块，命中 ${count} 块`
   if (count === 0) {
-    return `${head} / 0 个文件，root=${root}）\n未找到相似旧实现。若确为新功能，按 search-before-implement 在决策记录里写明"无可用旧实现"。`
+    return `${head} / 0 个文件）\n未找到相似旧实现；若确为新功能，在决策记录里写明「无可用旧实现」。`
   }
   const candidates: any[] = Array.isArray(value?.candidates) ? value.candidates : []
   const byFile = aggregate(candidates)
@@ -125,7 +124,7 @@ function renderSummary(args: any, value: any): string {
     const kind = String(c?.kind ?? '')
     kinds.set(kind, (kinds.get(kind) ?? 0) + 1)
   }
-  const lines = [`${head} / ${byFile.size} 个文件，root=${root}）`]
+  const lines = [`${head} / ${byFile.size} 个文件）`]
   lines.push(`kind：${[...kinds.entries()].map(([k, n]) => `${k} ${n}`).join(' · ')}`)
   lines.push('')
   for (const [path, info] of byFile) {
@@ -138,7 +137,7 @@ function renderSummary(args: any, value: any): string {
     lines.push(`[${index + 1}] ${String(c?.path)}:${String(c?.startLine)}-${String(c?.endLine)}  (${meta})`)
   })
   lines.push('')
-  lines.push('需要看代码：read <path> offset=<startLine> limit=<行数>（默认只回摘要；直接要片段把 detail 设为 true）。')
+  lines.push('看代码：read <path> offset=<startLine> limit=<n>；要片段设 detail=true。')
   return lines.join('\n')
 }
 
@@ -146,40 +145,40 @@ export function apply(ctx: any): void {
   const codeReuseSearchTool = defineTool({
     name: 'relation_search',
     description:
-      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 + 代码分词 + 可选 ast-grep 结构匹配）。默认只回扫描摘要：命中块数/文件数、按文件聚合、每条路径:行号 + kind/symbol/score，不含代码片段。需要看代码时用 read 打开 path/行号；要一次拿到片段就把 detail 设为 true。默认代码优先（文档/配置/生成物降权、每文件最多 2 块）；可选 kinds/include/exclude 做硬过滤。',
+      '检索本仓库已有的相似实现（BM25 + ast-grep），用于判断能否复用。默认回扫描摘要（命中数/文件、path:行号、kind/symbol/score，无代码）；看代码用 read，或设 detail=true 取片段。',
     parameters: {
       query: {
         type: 'string',
         required: true,
-        description: '你想实现的功能 / 标识符 / 中文描述，多个关键词用空格分开。',
+        description: '功能 / 标识符 / 中文描述；多个关键词空格分隔。',
       },
       root: {
         type: 'string',
-        description: '要检索的仓库根目录；默认当前会话工作目录。',
+        description: '仓库根目录；默认会话工作目录。',
       },
       limit: {
         type: 'number',
-        description: '返回候选数量，默认 8。',
+        description: '候选数，默认 8。',
       },
       astPattern: {
         type: 'string',
-        description: '可选 ast-grep 结构模式（如 "function $F($$$) { $$$ }"），额外做一次结构召回。',
+        description: 'ast-grep 模式（如 function $F($$$) { $$$ }），额外结构召回。',
       },
       kinds: {
         type: 'string',
-        description: '可选：硬过滤，只保留这些类型（逗号分隔：code/test/doc/config/generated/other）。',
+        description: '只保留这些 kind（逗号分隔：code/test/doc/config/generated/other）。',
       },
       include: {
         type: 'string',
-        description: '可选：硬过滤，只保留命中这些路径 glob 之一的文件（逗号分隔，* 跨目录，如 *.rs）。',
+        description: '路径 glob 白名单（逗号分隔，* 跨目录）。',
       },
       exclude: {
         type: 'string',
-        description: '可选：硬过滤，命中这些路径 glob 任一即排除（逗号分隔）。',
+        description: '路径 glob 黑名单（逗号分隔）。',
       },
       detail: {
         type: 'boolean',
-        description: '默认 false：只回扫描摘要（路径:行号 + kind/symbol/score，不含代码片段）。true：同时回每条的 snippet。',
+        description: 'true 时每条附代码片段；默认只回摘要。',
       },
     },
     output: {
