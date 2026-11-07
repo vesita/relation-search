@@ -12,15 +12,17 @@
 # 1) 先构建引擎（仓库根）
 cargo build --release
 
-# 2) 打包插件（prepack 会 tsc 到 lib/，并把引擎二进制放进 bin/）
+# 2) 打包插件（prepack 会 tsc 到 lib/；先把引擎二进制放进 bin/）
 mkdir -p bin && cp ../target/release/relation-search bin/relation-search
 pnpm install
-pnpm pack
+pnpm run dist        # 产物：../dist/dsh-relation-search-<version>.tgz
 
 # 3) 装进 profile（把 <profile> 换成正在用的，如 web）
-dsh plugin --profile <profile> add "file:$PWD/dsh-relation-search-<version>.tgz"
+dsh plugin --profile <profile> add "file:$PWD/../dist/dsh-relation-search-<version>.tgz"
 # 重启 dsh 后该 profile 的 agent 即可调用 relation_search
 ```
+
+> 打包产物统一输出到仓库根的 `dist/`（已进 `.gitignore`）；直接跑 `pnpm pack` 会落在 `plugin/` 下，别那么用。
 
 > 若 profile 的 `package.json` 的 `dsh.profile.bundles` 里没有 `dsh-relation-search`，需补一行再重启（参照已装插件的登记方式）。
 >

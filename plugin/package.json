@@ -27,6 +27,7 @@
   },
   "scripts": {
     "build": "rm -rf lib && tsc -p tsconfig.json",
+    "dist": "pnpm pack --pack-destination ../dist",
     "prepack": "pnpm run build",
     "test": "pnpm run build && node selfcheck.mjs"
   },

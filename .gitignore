@@ -1,6 +1,6 @@
 /target
+/dist
 **/node_modules
 plugin/lib
-plugin/*.tgz
 plugin/bin
 *.log

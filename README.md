@@ -43,11 +43,12 @@ relation-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n
 ## 构建
 
 ```bash
-cargo build --release            # 产物 target/release/relation-search
-cd plugin && pnpm install && pnpm build
+cargo build --release                        # 引擎：target/release/relation-search
+cd plugin && pnpm install && pnpm build      # 插件：tsc 到 lib/
+pnpm run dist                                # 打包：../dist/dsh-relation-search-<version>.tgz
 ```
 
-（本仓文档与注释跟随代码；插件安装见 `plugin/README.md`。）
+（本仓文档与注释跟随代码；插件安装见 `plugin/README.md`。打包产物统一在仓库根 `dist/`，不进 git。）
 
 ## 随包 skill
 

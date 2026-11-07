@@ -10,6 +10,7 @@
 ## 构建与测试
 - 引擎：`cargo build --release`（产物 `target/release/relation-search`）。
 - 插件：`cd plugin && pnpm install && pnpm run build && pnpm test`（`test` 需要先有引擎二进制；且 `@deepseek-ai/dsh-tools` 由宿主提供，脱离 profile 直接跑会找不到，须在宿主 `node_modules` 环境下运行或临时软链）。
+- 打包：`cd plugin && pnpm run dist`，产物统一输出到仓库根 `dist/`（已进 `.gitignore`）。
 - CLI 契约见 `README.md`；插件与 `plugin/selfcheck.mjs` 依赖其字段名，改契约要同时改这两处。
 
 ## 约定
