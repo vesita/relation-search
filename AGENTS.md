@@ -4,7 +4,8 @@
 
 ## 结构
 - `Cargo.toml` + `src/`：Rust 引擎（tantivy BM25 + 代码感知分词 + jieba-rs 中文分词 + 内嵌 ast-grep 结构召回，tree-sitter 语法随二进制，无需外部工具）。
-- `plugin/`：dsh 插件，`defineTool` 包装引擎，工具名 `relation_search`。
+- `src/engine.rs` + `src/engine/{facet,snippet,query,ast}.rs`：引擎按职责拆分；`open_index` / `create_index` 是唯一「打开/新建索引并注册分词器」的入口，建索引与检索共用。
+- `plugin/`：dsh 插件，`defineTool` 包装引擎，工具名 `relation_search`；每次检索用一次 `search --refresh` 完成增量索引 + 检索。
 - `fixtures/sample/`：插件端到端自检用的样例仓库。
 
 ## 构建与测试

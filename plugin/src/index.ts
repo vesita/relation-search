@@ -12,8 +12,8 @@
  *   3. 仓库开发态 `../../target/release/relation-search`；
  *   4. 退回 PATH 里的 `relation-search`。
  *
- * 每次检索前都会先跑一次增量 `index`（未变化的文件几乎瞬时），保证结果反映当前源码，
- * 而不是「同一进程只建一次索引、会话内改了代码仍读旧结果」。
+ * 每次检索用一次 `search --refresh` 完成「增量索引 + 检索」（未变化的文件几乎瞬时），
+ * 保证结果反映当前源码；不再为每次检索额外 spawn 一次 `index` 进程。
  * 索引目录由引擎按 `${RELATION_SEARCH_CACHE_DIR:-$HOME/.cache/relation-search}/<root 哈希>` 决定。
  */
 
@@ -95,11 +95,58 @@ function renderText(args: any, value: any): string {
   return lines.join('\n')
 }
 
+/** 按文件聚合候选：命中块数、最佳分、涉及 kind。 */
+function aggregate(candidates: any[]): Map<string, { hits: number; best: number; kinds: Set<string> }> {
+  const byFile = new Map<string, { hits: number; best: number; kinds: Set<string> }>()
+  for (const c of candidates) {
+    const path = String(c?.path ?? '')
+    const prev = byFile.get(path) ?? { hits: 0, best: 0, kinds: new Set<string>() }
+    prev.hits += 1
+    prev.best = Math.max(prev.best, Number(c?.score ?? 0))
+    prev.kinds.add(String(c?.kind ?? ''))
+    byFile.set(path, prev)
+  }
+  return byFile
+}
+
+/** 默认渲染：只回扫描摘要，不把代码片段塞进上下文。 */
+function renderSummary(args: any, value: any): string {
+  const count = Number(value?.count ?? 0)
+  const documents = Number(value?.documents ?? 0)
+  const root = String(value?.root ?? '')
+  const head = `复用检索：${String(args?.query ?? '')}（扫描 ${documents > 0 ? documents : '?'} 块，命中 ${count} 块`
+  if (count === 0) {
+    return `${head} / 0 个文件，root=${root}）\n未找到相似旧实现。若确为新功能，按 search-before-implement 在决策记录里写明"无可用旧实现"。`
+  }
+  const candidates: any[] = Array.isArray(value?.candidates) ? value.candidates : []
+  const byFile = aggregate(candidates)
+  const kinds = new Map<string, number>()
+  for (const c of candidates) {
+    const kind = String(c?.kind ?? '')
+    kinds.set(kind, (kinds.get(kind) ?? 0) + 1)
+  }
+  const lines = [`${head} / ${byFile.size} 个文件，root=${root}）`]
+  lines.push(`kind：${[...kinds.entries()].map(([k, n]) => `${k} ${n}`).join(' · ')}`)
+  lines.push('')
+  for (const [path, info] of byFile) {
+    lines.push(`  ${path}  ${info.hits} 块 · ${[...info.kinds].join('/')} · 最高 ${info.best.toFixed(2)}`)
+  }
+  lines.push('')
+  candidates.forEach((c, index) => {
+    const score = typeof c?.score === 'number' ? c.score.toFixed(2) : String(c?.score ?? '')
+    const meta = [String(c?.kind ?? ''), String(c?.symbol ?? ''), `score ${score}`].filter(Boolean).join(' · ')
+    lines.push(`[${index + 1}] ${String(c?.path)}:${String(c?.startLine)}-${String(c?.endLine)}  (${meta})`)
+  })
+  lines.push('')
+  lines.push('需要看代码：read <path> offset=<startLine> limit=<行数>（默认只回摘要；直接要片段把 detail 设为 true）。')
+  return lines.join('\n')
+}
+
 export function apply(ctx: any): void {
   const codeReuseSearchTool = defineTool({
     name: 'relation_search',
     description:
-      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 全文 + 代码分词 + 可选 ast-grep 结构匹配）。默认代码优先（文档/配置/生成物降权、每文件最多 2 块）；可选 kinds/include/exclude 做硬过滤。返回候选的文件:行、代码片段、文件类型 kind 与所在 symbol、命中来源，用于判断能否复用旧实现、避免重复造轮子。',
+      '在写新功能前检索本仓库里已有的相似实现（tantivy BM25 + 代码分词 + 可选 ast-grep 结构匹配）。默认只回扫描摘要：命中块数/文件数、按文件聚合、每条路径:行号 + kind/symbol/score，不含代码片段。需要看代码时用 read 打开 path/行号；要一次拿到片段就把 detail 设为 true。默认代码优先（文档/配置/生成物降权、每文件最多 2 块）；可选 kinds/include/exclude 做硬过滤。',
     parameters: {
       query: {
         type: 'string',
@@ -130,6 +177,10 @@ export function apply(ctx: any): void {
         type: 'string',
         description: '可选：硬过滤，命中这些路径 glob 任一即排除（逗号分隔）。',
       },
+      detail: {
+        type: 'boolean',
+        description: '默认 false：只回扫描摘要（路径:行号 + kind/symbol/score，不含代码片段）。true：同时回每条的 snippet。',
+      },
     },
     output: {
       schema: {
@@ -137,6 +188,7 @@ export function apply(ctx: any): void {
         additionalProperties: false,
         properties: {
           root: { type: 'string', required: true },
+          documents: { type: 'number' },
           count: { type: 'number', required: true },
           candidates: {
             type: 'array',
@@ -150,7 +202,7 @@ export function apply(ctx: any): void {
                 endLine: { type: 'number', required: true },
                 score: { type: 'number', required: true },
                 source: { type: 'string', required: true },
-                snippet: { type: 'string', required: true },
+                snippet: { type: 'string' },
                 kind: { type: 'string', required: true },
                 symbol: { type: 'string', required: true },
               },
@@ -158,7 +210,9 @@ export function apply(ctx: any): void {
           },
         },
       },
-      render: (args: any, value: any) => [{ type: 'text', text: renderText(args, value) }],
+      render: (args: any, value: any) => [
+        { type: 'text', text: args?.detail ? renderText(args, value) : renderSummary(args, value) },
+      ],
     },
     async execute(args: any, exec: any) {
       let root: string = args?.root
@@ -169,11 +223,12 @@ export function apply(ctx: any): void {
       root = resolve(root)
       const binary = resolveBinary()
 
-      // 每次检索前做一次增量 index：只处理新增/修改/删除的文件（未变文件几乎瞬时），
-      // 既保证 root 首次可用，也保证会话内改动的代码能被搜到。
-      await runEngine(binary, ['index', '--root', root], exec?.signal)
-
-      const cliArgs = ['search', '--root', root, '--query', String(args?.query ?? '')]
+      // 一次进程完成「增量索引 + 检索」：`--refresh` 让引擎先跑增量 index，
+      // 既保证 root 首次可用与会话内改动可见，又把刷新策略留在引擎一处。
+      const detail = Boolean(args?.detail)
+      const cliArgs = ['search', '--root', root, '--query', String(args?.query ?? ''), '--refresh']
+      // 默认只回摘要：引擎跳过 snippet 生成，工具结果也不带代码片段（省上下文）。
+      if (!detail) cliArgs.push('--summary')
       if (args?.limit) cliArgs.push('--limit', String(args.limit))
       if (args?.astPattern) cliArgs.push('--ast-pattern', String(args.astPattern))
       if (args?.kinds) cliArgs.push('--kinds', String(args.kinds))
@@ -181,10 +236,19 @@ export function apply(ctx: any): void {
       if (args?.exclude) cliArgs.push('--exclude', String(args.exclude))
 
       const result = await runEngine(binary, cliArgs, exec?.signal)
+      const rawCandidates: any[] = Array.isArray(result?.candidates) ? result.candidates : []
+      const candidates = detail
+        ? rawCandidates
+        : rawCandidates.map((c: any) => {
+            const copy = { ...c }
+            delete copy.snippet
+            return copy
+          })
       return {
         root: typeof result?.root === 'string' ? result.root : root,
-        count: typeof result?.count === 'number' ? result.count : Array.isArray(result?.candidates) ? result.candidates.length : 0,
-        candidates: Array.isArray(result?.candidates) ? result.candidates : [],
+        documents: typeof result?.documents === 'number' ? result.documents : 0,
+        count: typeof result?.count === 'number' ? result.count : rawCandidates.length,
+        candidates,
       }
     },
     presentCall(args: any) {

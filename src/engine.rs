@@ -1,14 +1,16 @@
 //! 引擎：schema、建索引、BM25 检索、snippet、可选 ast-grep 结构召回、输出结构。
+//!
+//! 模块边界：`facet`（kind/过滤）、`snippet`、`query`、`ast` 各自独立；建索引与检索
+//! 共享同一套字段定义与分词器注册。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
 use tantivy::merge_policy::LogMergePolicy;
-use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
+use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, Term, TextFieldIndexing,
     TextOptions, Value,
@@ -18,11 +20,19 @@ use tantivy::{
     DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument, TantivyError, doc,
 };
 
-use ast_grep_core::Pattern;
-use ast_grep_language::{Language, LanguageExt, SupportLang};
-
 use crate::chunk::{chunk_text, for_each_text_file};
-use crate::tokenizer::{TOKENIZER_NAME, build_analyzer, has_cjk, tokenize_to_strings};
+use crate::tokenizer::{TOKENIZER_NAME, build_analyzer, has_cjk};
+
+mod ast;
+mod facet;
+mod query;
+mod snippet;
+
+use ast::ast_candidates;
+pub use facet::Filter;
+use facet::{CompiledFilter, classify_kind, kind_id, kind_weight_from_id};
+use query::build_query;
+use snippet::{cheap_snippet, snippet_text};
 
 const PATH_FIELD: &str = "path";
 const START_FIELD: &str = "start_line";
@@ -74,15 +84,50 @@ pub fn build_schema() -> Schema {
     b.build()
 }
 
-fn field_ids(schema: &Schema) -> Result<(Field, Field, Field, Field, Field, Field)> {
-    Ok((
-        schema.get_field(PATH_FIELD)?,
-        schema.get_field(START_FIELD)?,
-        schema.get_field(END_FIELD)?,
-        schema.get_field(CONTENT_FIELD)?,
-        schema.get_field(KIND_ID_FIELD)?,
-        schema.get_field(FILE_FIELD)?,
-    ))
+/// schema 里用到的字段句柄。建索引与检索共用同一套（避免两处各取一遍、各注册一次分词器）。
+#[derive(Clone, Copy)]
+struct Fields {
+    path: Field,
+    start_line: Field,
+    end_line: Field,
+    content: Field,
+    kind: Field,
+    file: Field,
+}
+
+fn field_ids(schema: &Schema) -> Result<Fields> {
+    Ok(Fields {
+        path: schema.get_field(PATH_FIELD)?,
+        start_line: schema.get_field(START_FIELD)?,
+        end_line: schema.get_field(END_FIELD)?,
+        content: schema.get_field(CONTENT_FIELD)?,
+        kind: schema.get_field(KIND_ID_FIELD)?,
+        file: schema.get_field(FILE_FIELD)?,
+    })
+}
+
+/// 打开已有索引并注册自定义分词器。
+///
+/// tantivy 的 `TokenizerManager` 不随 `open_in_dir` 保留，检索前必须重新注册；
+/// 建索引/检索/测试都走这个入口，避免「某处忘了注册」只在运行时才暴露。
+fn open_index(index_dir: &Path) -> Result<(Index, Fields)> {
+    let index = Index::open_in_dir(index_dir)
+        .with_context(|| format!("无法打开索引目录: {}", index_dir.display()))?;
+    index
+        .tokenizers()
+        .register(TOKENIZER_NAME, build_analyzer());
+    let fields = field_ids(&index.schema())?;
+    Ok((index, fields))
+}
+
+/// 新建索引并注册自定义分词器（与 `open_index` 同一套字段/分词器）。
+fn create_index(index_dir: &Path) -> Result<(Index, Fields)> {
+    let index = Index::create_in_dir(index_dir, build_schema())?;
+    index
+        .tokenizers()
+        .register(TOKENIZER_NAME, build_analyzer());
+    let fields = field_ids(&index.schema())?;
+    Ok((index, fields))
 }
 
 /// 默认索引目录：`${RELATION_SEARCH_CACHE_DIR:-$HOME/.cache/relation-search}/<canonical root 的稳定哈希>`。
@@ -226,18 +271,20 @@ pub fn index_root_with_mode(
         .canonicalize()
         .with_context(|| format!("无法规范化索引目录: {}", index_dir.display()))?;
 
-    // 2) 打开或新建索引。
-    let index = if incremental {
-        Index::open_in_dir(&index_dir_abs)?
+    // 2) 打开或新建索引（统一走 open_index/create_index：字段与分词器注册只有一处）。
+    let (index, fields) = if incremental {
+        open_index(&index_dir_abs)?
     } else {
-        Index::create_in_dir(&index_dir_abs, build_schema())?
+        create_index(&index_dir_abs)?
     };
-    // 关键坑：索引与检索都必须注册自定义分词器。
-    index
-        .tokenizers()
-        .register(TOKENIZER_NAME, build_analyzer());
-
-    let (path_f, start_f, end_f, content_f, kind_f, file_f) = field_ids(&index.schema())?;
+    let Fields {
+        path: path_f,
+        start_line: start_f,
+        end_line: end_f,
+        content: content_f,
+        kind: kind_f,
+        file: file_f,
+    } = fields;
     let mut writer: IndexWriter<TantivyDocument> = index.writer(WRITER_MEMORY_BUDGET)?;
     // 增量会不断产生删除墓碑；默认 `del_docs_ratio_before_merge=1.0` 使墓碑永不被 merge 回收，
     // 调小该比例让 merge 真正清理旧块（配合结尾的 wait_merging_threads）。
@@ -441,6 +488,8 @@ pub struct Candidate {
     pub start_line: u64,
     pub end_line: u64,
     pub score: f64,
+    /// 代码片段；`--summary` 模式不生成，序列化时省略空串。
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub snippet: String,
     pub source: String, // "bm25" 或 "ast"
     pub kind: String,   // "code" | "test" | "doc" | "config" | "generated" | "other"
@@ -463,75 +512,10 @@ struct PendingCandidate {
 pub struct SearchJson {
     pub query: String,
     pub root: String,
+    /// 索引里当前的块总数（扫描面），用于摘要里说明「在多少块里命中多少」。
+    pub documents: u64,
     pub count: usize,
     pub candidates: Vec<Candidate>,
-}
-
-/// 检索的硬过滤（与排序权重不同：不满足即排除，而非降权）。
-#[derive(Debug, Default, Clone)]
-pub struct Filter {
-    /// 只保留这些 kind（空 = 不按 kind 过滤）。
-    pub kinds: Vec<String>,
-    /// 路径 glob：给定时必须至少命中一个（空 = 不过滤）。
-    pub include: Vec<String>,
-    /// 路径 glob：命中任一即排除（空 = 不排除）。
-    pub exclude: Vec<String>,
-}
-
-/// 编译后的过滤器（glob 只编译一次）。
-struct CompiledFilter {
-    kinds: Vec<String>,
-    include: Option<GlobSet>,
-    exclude: Option<GlobSet>,
-}
-
-impl CompiledFilter {
-    fn compile(filter: &Filter) -> Result<Self> {
-        const KNOWN_KINDS: &[&str] = &["code", "test", "doc", "config", "generated", "other"];
-        for kind in &filter.kinds {
-            if !KNOWN_KINDS.contains(&kind.as_str()) {
-                anyhow::bail!("未知的 kind: {kind}（可选：{}）", KNOWN_KINDS.join(" / "));
-            }
-        }
-        Ok(Self {
-            kinds: filter.kinds.clone(),
-            include: build_globset(&filter.include, "include")?,
-            exclude: build_globset(&filter.exclude, "exclude")?,
-        })
-    }
-
-    fn passes(&self, path: &str) -> bool {
-        if !self.kinds.is_empty() && !self.kinds.iter().any(|k| k == classify_kind(path)) {
-            return false;
-        }
-        if let Some(include) = &self.include
-            && !include.is_match(path)
-        {
-            return false;
-        }
-        if let Some(exclude) = &self.exclude
-            && exclude.is_match(path)
-        {
-            return false;
-        }
-        true
-    }
-}
-
-fn build_globset(patterns: &[String], what: &str) -> Result<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        // literal_separator(false)：`*` 可跨目录，符合「`*.rs` = 所有 rust 文件」的直觉。
-        let glob = GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-            .with_context(|| format!("无效的 {what} glob 模式: {pattern}"))?;
-        builder.add(glob);
-    }
-    Ok(Some(builder.build().context("构建 glob 过滤器失败")?))
 }
 
 /// 检索选项：默认值等价于 0.2.10 的行为（8 条、代码优先、每文件最多 2 块）。
@@ -551,6 +535,8 @@ pub struct SearchOptions {
     pub kind_weight: bool,
     /// 每文件最多保留的块数；`None` = 不限制（`--no-per-file-cap`）。
     pub per_file_cap: Option<usize>,
+    /// 只回扫描摘要：`candidates` 不带 snippet（省上下文，也省 snippet 生成成本）。
+    pub summary: bool,
 }
 
 impl Default for SearchOptions {
@@ -563,6 +549,7 @@ impl Default for SearchOptions {
             refresh: false,
             kind_weight: true,
             per_file_cap: Some(DEFAULT_PER_FILE_CAP),
+            summary: false,
         }
     }
 }
@@ -616,19 +603,20 @@ pub fn search_root_with_options(
         }
     }
 
-    let mut index = Index::open_in_dir(index_dir)
-        .with_context(|| format!("无法打开索引目录: {}", index_dir.display()))?;
+    let (mut index, fields) = open_index(index_dir)?;
     // 多 segment 时按 segment 并行检索；初始化失败不应让检索本身失败，退回单线程。
     index.set_default_multithread_executor().ok();
-    // 关键坑：open_in_dir 之后 TokenizerManager 不保留，必须重新注册，否则 QueryParser 报
-    // "Error getting tokenizer for field"。
-    index
-        .tokenizers()
-        .register(TOKENIZER_NAME, build_analyzer());
-
-    let (path_f, start_f, end_f, content_f, kind_f, _file_f) = field_ids(&index.schema())?;
+    let Fields {
+        path: path_f,
+        start_line: start_f,
+        end_line: end_f,
+        content: content_f,
+        kind: kind_f,
+        file: _file_f,
+    } = fields;
     let reader = index.reader()?;
     let searcher = reader.searcher();
+    let documents = searcher.num_docs();
     // 1) 内容查询（代码片段安全：分词后按词项 OR 召回，不用 QueryParser）。
     let content_query = build_query(content_f, &options.query);
     // 2) kind 硬过滤下推到查询期：只对目标 kind 的子集做 BM25，避免「先取小池再后过滤」丢候选。
@@ -769,9 +757,7 @@ pub fn search_root_with_options(
     }
 
     let mut candidates = match options.per_file_cap {
-        Some(per_file) => cap_per_file(candidates, per_file, limit, |c| {
-            c.candidate.path.as_str()
-        }),
+        Some(per_file) => cap_per_file(candidates, per_file, limit, |c| c.candidate.path.as_str()),
         // `--no-per-file-cap`：只按 limit 截断，不再压每文件块数。
         None => candidates.into_iter().take(limit).collect(),
     };
@@ -779,11 +765,14 @@ pub fn search_root_with_options(
     // snippet 只为最终候选生成（见 PendingCandidate 注释）。
     // 另：纯 ASCII 查询 + CJK 正文时，改用「定位查询词窗口」的廉价实现——此时
     // SnippetGenerator 的唯一作用也是找同一个词，却会把 jieba 词典加载进来。
+    // `--summary`：整段跳过生成，只回路径/行号/kind/symbol/分数。
     let query_has_cjk = has_cjk(options.query.as_str());
     let candidates: Vec<Candidate> = candidates
         .drain(..)
         .map(|mut pending| {
-            if let Some(content) = pending.content.take() {
+            if options.summary {
+                pending.candidate.snippet.clear();
+            } else if let Some(content) = pending.content.take() {
                 pending.candidate.snippet = if !query_has_cjk && has_cjk(&content) {
                     cheap_snippet(&content, &options.query)
                 } else {
@@ -797,304 +786,10 @@ pub fn search_root_with_options(
     Ok(SearchJson {
         query: options.query.clone(),
         root: root_abs.to_string_lossy().to_string(),
+        documents,
         count: candidates.len(),
         candidates,
     })
-}
-
-/// 把查询串构成 BM25 查询。
-///
-/// 关键：**不走 tantivy 的 `QueryParser`**。用户给的多半是代码片段（`IndexWriter::commit`、
-/// `fn(user_id)`、`foo[0]`、`"xxx`），`QueryParser` 会把 `:`/`[`/`(`/引号当成查询语法而直接
-/// 报语法错（整个 search 退出码非 0），也会把 `-`/`|`/`.` 拆成的多段强绑成「相邻短语」
-/// （`index-writing` 反而搜不到）。这里复用建索引时的同一个分析管线（`build_analyzer`）把查询切成词项：
-/// - 每个词项一条 `TermQuery`（`Should`/OR）：任一命中即可召回，标点不再是语法；
-/// - 词项多于一个时再加一条整串 `PhraseQuery`（`Should`）：词项**相邻**出现（如完整标识符
-///   `user_profile_cache`）时额外贡献 BM25 分，把「精确命中该符号」的块排到更前。
-///
-/// 于是既保住代码片段的召回，又保住标识符检索的排序精度。空查询返回匹配空集。
-fn build_query(content_f: Field, query: &str) -> Box<dyn Query> {
-    let raw = tokenize_to_strings(query);
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut terms: Vec<Term> = Vec::with_capacity(raw.len());
-    for token in &raw {
-        if token.is_empty() || !seen.insert(token.as_str()) {
-            continue;
-        }
-        terms.push(Term::from_field_text(content_f, token));
-    }
-    if terms.is_empty() {
-        return Box::new(EmptyQuery);
-    }
-    // WithFreqs：BM25 需要词频打分；content 字段本就用 WithFreqsAndPositions 建索引。
-    let mut clauses: Vec<(Occur, Box<dyn Query>)> = terms
-        .iter()
-        .map(|t| {
-            (
-                Occur::Should,
-                Box::new(TermQuery::new(t.clone(), IndexRecordOption::WithFreqs)) as Box<dyn Query>,
-            )
-        })
-        .collect();
-    if terms.len() > 1 {
-        clauses.push((Occur::Should, Box::new(PhraseQuery::new(terms))));
-    }
-    Box::new(BooleanQuery::new(clauses))
-}
-
-/// 用内嵌 ast-grep（tree-sitter 语法已编入二进制）做结构搜索，无需外部 `sg`。
-/// 按文件扩展名判定语言；该语言不支持或 pattern 解析失败的文件跳过。
-fn ast_candidates(
-    root: &Path,
-    pattern_src: &str,
-    limit: usize,
-    filter: &CompiledFilter,
-) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = Vec::new();
-    let root = match root.canonicalize() {
-        Ok(r) => r,
-        Err(_) => return out,
-    };
-    // Pattern::try_new 会把源码解析成 AST 模式树，有实打实的解析成本；旧写法在「每个文件」
-    // 里都重新编译一次（N 个文件 = N 次编译）。这里按语言缓存：同一语言只编译一次，
-    // 编译失败也缓存 None（该语言下所有文件都跳过）。
-    let mut patterns: HashMap<SupportLang, Option<Pattern>> = HashMap::new();
-    let _ = for_each_text_file(&root, |path, content| {
-        if out.len() >= limit {
-            return Ok(());
-        }
-        let Some(lang) = SupportLang::from_path(path) else {
-            return Ok(());
-        };
-        let pattern = patterns
-            .entry(lang)
-            .or_insert_with(|| Pattern::try_new(pattern_src, lang).ok());
-        let Some(pattern) = pattern.as_ref() else {
-            return Ok(());
-        };
-        let source = lang.ast_grep(content);
-        let root_node = source.root();
-        let rel = path
-            .strip_prefix(&root)
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_default();
-        if !filter.passes(&rel) {
-            return Ok(());
-        }
-        for m in root_node.find_all(pattern) {
-            if out.len() >= limit {
-                break;
-            }
-            out.push(Candidate {
-                kind: classify_kind(&rel).to_string(),
-                symbol: extract_symbol(&m.text()),
-                path: rel.clone(),
-                start_line: m.start_pos().line() as u64 + 1,
-                end_line: m.end_pos().line() as u64 + 1,
-                score: 0.0,
-                snippet: truncate_chars(&m.text(), 240),
-                source: "ast".to_string(),
-            });
-        }
-        Ok(())
-    });
-    out
-}
-
-/// 用 tantivy 的 SnippetGenerator 生成摘要片段；取不到片段时退化为「取前 240 字符」。
-fn snippet_text(generator: &SnippetGenerator, content: &str) -> String {
-    let snippet = generator.snippet(content);
-    let fragment = snippet.fragment();
-    if fragment.is_empty() {
-        truncate_chars(content, 240)
-    } else {
-        fragment.to_string()
-    }
-}
-
-/// 廉价摘要：按查询词在正文里的首个出现位置取一个 ~240 字符窗口。
-///
-/// 用于「纯 ASCII 查询 + CJK 正文」：此时走 `SnippetGenerator` 会为分词 CJK 正文触发
-/// jieba 初始化（约 60ms），而它要做的也只是定位同样的查询词，用不着词典。
-fn cheap_snippet(content: &str, query: &str) -> String {
-    for token in tokenize_to_strings(query) {
-        if let Some(pos) = find_ci(content, &token) {
-            return window_around(content, pos, 240, 80);
-        }
-    }
-    truncate_chars(content, 240)
-}
-
-/// 大小写不敏感查找，返回在 hay 里的字节位置。
-fn find_ci(hay: &str, needle: &str) -> Option<usize> {
-    if needle.is_empty() {
-        return None;
-    }
-    hay.to_lowercase().find(&needle.to_lowercase())
-}
-
-/// 以 pos 为中心向前 back 字节起、总长约 len 字节取窗口（对齐 UTF-8 边界）。
-fn window_around(content: &str, pos: usize, len: usize, back: usize) -> String {
-    let start = floor_char_boundary(content, pos.saturating_sub(back));
-    let end = ceil_char_boundary(content, start.saturating_add(len));
-    content[start..end].to_string()
-}
-
-fn floor_char_boundary(s: &str, mut i: usize) -> usize {
-    if i > s.len() {
-        i = s.len();
-    }
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
-    let n = s.len();
-    if i >= n {
-        return n;
-    }
-    while i < n && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
-
-/// 判断文件类型：代码 / 测试 / 文档 / 配置 / 生成物 / 其它。
-/// 目的：检索默认「代码优先」——文档、配置、编译产物在实现检索里是噪声，应排在源码之后。
-fn classify_kind(path: &str) -> &'static str {
-    if is_generated(path) {
-        return "generated";
-    }
-    let lower = path.to_ascii_lowercase();
-    let file = lower.rsplit('/').next().unwrap_or(&lower);
-    let ext = file.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    let is_code = matches!(
-        ext,
-        "rs" | "ts"
-            | "tsx"
-            | "js"
-            | "jsx"
-            | "mjs"
-            | "cjs"
-            | "py"
-            | "go"
-            | "java"
-            | "kt"
-            | "kts"
-            | "c"
-            | "h"
-            | "cc"
-            | "cpp"
-            | "cxx"
-            | "hpp"
-            | "hh"
-            | "cs"
-            | "rb"
-            | "php"
-            | "swift"
-            | "m"
-            | "mm"
-            | "scala"
-            | "lua"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "sql"
-            | "r"
-            | "jl"
-            | "dart"
-            | "ex"
-            | "exs"
-            | "erl"
-            | "hs"
-            | "clj"
-            | "vue"
-            | "svelte"
-            | "astro"
-    );
-    if is_code {
-        let in_tests = lower.contains("/tests/")
-            || lower.starts_with("tests/")
-            || lower.contains("/test/")
-            || lower.contains("/__tests__/");
-        let name_test = file.contains("_test.")
-            || file.starts_with("test_")
-            || file.contains(".test.")
-            || file.contains(".spec.");
-        return if in_tests || name_test {
-            "test"
-        } else {
-            "code"
-        };
-    }
-    match ext {
-        "md" | "markdown" | "mdx" | "rst" | "txt" | "adoc" => "doc",
-        "toml" | "yaml" | "yml" | "json" | "jsonc" | "ini" | "cfg" | "conf" | "lock" | "env"
-        | "properties" => "config",
-        _ => "other",
-    }
-}
-
-/// 编译/打包产物（不在 SKIP_DIRS 覆盖范围内的那些）：min/bundle/generated 后缀，
-/// 或 `/lib/` 目录下的 .js（插件 `tsc` 到 `lib/` 的产物）。它们是噪声，降权。
-fn is_generated(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    let file = lower.rsplit('/').next().unwrap_or(&lower);
-    let name_generated = file.ends_with(".min.js")
-        || file.ends_with(".bundle.js")
-        || file.ends_with(".generated.js")
-        || file.ends_with(".generated.ts")
-        || file.contains(".generated.");
-    let lib_js = lower.contains("/lib/")
-        && (file.ends_with(".js") || file.ends_with(".cjs") || file.ends_with(".mjs"));
-    name_generated || lib_js
-}
-
-/// 文件类型对最终排序的权重：实现代码满分；文档/配置/生成物显著降权（仍可被召回，只是排在后面）。
-fn kind_weight(kind: &str) -> f64 {
-    match kind {
-        "code" => 1.0,
-        "test" => 0.85,
-        "doc" => 0.30,
-        "config" => 0.35,
-        "generated" => 0.15,
-        _ => 0.60,
-    }
-}
-
-/// kind 名称 → 稳定编号（写入 kind_id 字段；已有编号不要改，否则旧语义漂移）。
-fn kind_id(kind: &str) -> u64 {
-    match kind {
-        "code" => 0,
-        "test" => 1,
-        "doc" => 2,
-        "config" => 3,
-        "generated" => 4,
-        _ => 5,
-    }
-}
-
-/// 编号 → kind 名称（与 kind_id 对应）。
-fn kind_from_id(id: u64) -> &'static str {
-    match id {
-        0 => "code",
-        1 => "test",
-        2 => "doc",
-        3 => "config",
-        4 => "generated",
-        _ => "other",
-    }
-}
-
-/// 编号对应的排序权重（复用 kind_weight，保证两处一致）。
-fn kind_weight_from_id(id: u64) -> f64 {
-    kind_weight(kind_from_id(id))
 }
 
 /// 两个 1 基闭区间 [a1,a2] 与 [b1,b2] 是否重叠。
@@ -1124,7 +819,7 @@ where
 
 /// 尽力从块内容里取「所在定义」的签名（`fn foo` / `struct Bar` / `class Baz` …），取不到返回空串。
 /// 只做启发式：扫块内首个看起来像定义的行（切块按空行分段，块通常以定义起始）。
-fn extract_symbol(content: &str) -> String {
+pub(super) fn extract_symbol(content: &str) -> String {
     const KWS: &[&str] = &[
         "fn",
         "func",

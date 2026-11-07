@@ -2,8 +2,8 @@
 
 把 `relation-search` Rust 引擎包成 dsh 工具 `relation_search`。
 
-- 工具参数：`query`（必填）、`root`（默认会话工作目录）、`limit`（默认 8）、`astPattern`（可选 ast-grep 模式；ast-grep 已编入引擎二进制，无需外部 `sg`）。
-- 每次检索前都会先跑一次**增量 `index`**（只处理新增/修改/删除的文件，未变文件几乎瞬时），保证结果反映当前源码。
+- 工具参数：`query`（必填）、`root`（默认会话工作目录）、`limit`（默认 8）、`astPattern`（可选 ast-grep 模式；ast-grep 已编入引擎二进制，无需外部 `sg`）、`kinds`/`include`/`exclude`（硬过滤）、`detail`（默认 false：只回扫描摘要，不含代码片段；true 时附 snippet）。
+- 每次检索用一次 `search --refresh` 完成「增量 `index` + 检索」（只处理新增/修改/删除的文件，未变文件几乎瞬时），保证结果反映当前源码；一次进程完成，不再额外 spawn 一次 `index`。
 - 二进制解析顺序：`RELATION_SEARCH_BIN` → 包内 `bin/relation-search` → 仓库 `../../target/release/relation-search` → PATH。
 
 ## 构建与安装

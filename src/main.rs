@@ -70,6 +70,9 @@ enum Command {
         /// 关闭「同一文件最多保留 2 块」的截断
         #[arg(long)]
         no_per_file_cap: bool,
+        /// 只回扫描摘要：candidates 不带 snippet（先扫一遍再决定细看哪条）
+        #[arg(long)]
+        summary: bool,
     },
 }
 
@@ -120,6 +123,7 @@ fn run() -> Result<()> {
             refresh,
             no_kind_weight,
             no_per_file_cap,
+            summary,
         } => {
             let index_dir = match index_dir {
                 Some(d) => d,
@@ -142,6 +146,7 @@ fn run() -> Result<()> {
                 } else {
                     Some(DEFAULT_PER_FILE_CAP)
                 },
+                summary,
             };
             let out = search_root_with_options(&root, &index_dir, &options)?;
             println!("{}", serde_json::to_string(&out)?);

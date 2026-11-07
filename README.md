@@ -12,18 +12,19 @@
 
 ```
 relation-search index  --root <path> [--index-dir <dir>] [--rebuild]
-relation-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n>] [--ast-pattern <p>] [--kinds <k1,k2>] [--include <g1,g2>] [--exclude <g1,g2>] [--refresh] [--no-kind-weight] [--no-per-file-cap]
+relation-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n>] [--ast-pattern <p>] [--kinds <k1,k2>] [--include <g1,g2>] [--exclude <g1,g2>] [--refresh] [--no-kind-weight] [--no-per-file-cap] [--summary]
 ```
 
 - `index` 成功向 stdout 打印 JSON：`{"ok":true,"documents":<n>,"indexDir":"<abs>"}`，退出码 0。其中 `documents` 是**当前索引内的块总数**（增量更新后为更新后的总数，而非本次新写入的块数）。
 - `index --rebuild`：**强制全量重建**——忽略已有 `manifest.json`，安全删除索引目录后从头建索引；用于索引损坏 / 清单与实际不一致时自愈。删除前只接受「本工具管理的索引目录」（空目录、带所有权标记 `.relation-search-index`、或目录内全是 tantivy 索引产物且含 `meta.json` / `manifest.json`）；只要混入任何非索引文件就拒绝删除。`--index-dir` 等于 `root` 或为 `root` 的祖先时直接报错。不加 `--rebuild` 时行为不变（有匹配清单就走增量）。
 - `search` 成功向 stdout 打印 JSON：
   ```json
-  {"query":"...","root":"...","count":2,"candidates":[
+  {"query":"...","root":"...","documents":264,"count":2,"candidates":[
     {"path":"rel/file.rs","startLine":10,"endLine":28,"score":12.3,"snippet":"...","source":"bm25","kind":"code","symbol":"fn user_profile_cache"}
   ]}
   ```
-  `source` 取 `bm25` 或 `ast`；无命中时 `count:0,"candidates":[]`，退出码 0。
+  `source` 取 `bm25` 或 `ast`；`documents` 是索引内当前块总数（扫描面）；无命中时 `count:0,"candidates":[]`，退出码 0。
+- `--summary`：只回扫描摘要——`candidates` 不带 `snippet`（引擎也跳过片段生成），并带回 `documents`（索引块总数）。用于「先扫一遍命中面，再决定细看哪条」，配合 `--limit` 可低成本扩大扫描范围。
   `kind` 取 `code` / `test` / `doc` / `config` / `generated` / `other`；`symbol` 是块内首个定义签名（`fn foo` / `struct Bar` …，尽力而为，取不到为空串）。
 - `search` 默认**代码优先**：文件类型权重（`code` 1.0 / `test` 0.85 / `doc` 0.30 / `config` 0.35 / `generated` 0.15 / 其它 0.60）在 BM25 **收集阶段**并入打分（`TopDocs::tweak_score`），并对**同一文件最多保留 2 块**——避免文档/配置或单个大文件把候选位占满。返回的 `score` 是加权后的最终排序分。
   - `--no-kind-weight`：关闭上述 kind 权重，`score` 变回**原始 BM25**（文件类型不再影响排序）；适合通用文本 / 记忆类检索。
