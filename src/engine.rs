@@ -14,7 +14,9 @@ use tantivy::schema::{
     TextOptions, Value,
 };
 use tantivy::snippet::SnippetGenerator;
-use tantivy::{DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument, doc};
+use tantivy::{
+    DocId, Index, IndexWriter, Score, SegmentReader, TantivyDocument, TantivyError, doc,
+};
 
 use ast_grep_core::Pattern;
 use ast_grep_language::{Language, LanguageExt, SupportLang};
@@ -423,6 +425,14 @@ fn is_index_artifact_name(name: &str) -> bool {
     )
 }
 
+/// 错误链里是否有 tantivy 的 writer 锁冲突（另一个进程正在写同一个索引目录）。
+pub fn index_dir_busy(error: &anyhow::Error) -> bool {
+    matches!(
+        error.root_cause().downcast_ref::<TantivyError>(),
+        Some(TantivyError::LockFailure(..))
+    )
+}
+
 /// 一条检索候选。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -583,7 +593,16 @@ pub fn search_root_with_options(
     // 索引不存在（或不是有效 tantivy 索引）→ 自动建，方便插件即插即用；
     // `--refresh` 则不管索引是否已存在，都先跑一次增量索引，把新增/修改/删除同步进来。
     if options.refresh || !index_dir.join("meta.json").exists() {
-        index_root(&root_abs, index_dir)?;
+        match index_root(&root_abs, index_dir) {
+            Ok(_) => {}
+            // 同一索引目录的 tantivy writer 是排他锁：插件每次检索前都会 refresh，
+            // 多个会话/多个 CLI 并发时必然有人拿不到锁。这时**沿用现有索引继续检索**，
+            // 而不是让整个检索失败（下一次 refresh 会补上这次的改动）。
+            Err(error) if index_dir_busy(&error) && index_dir.join("meta.json").exists() => {
+                eprintln!("索引正被其它进程更新，本次检索沿用现有索引（改动下次 refresh 生效）");
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let mut index = Index::open_in_dir(index_dir)
@@ -1163,6 +1182,56 @@ mod tests {
         let out = cap_per_file(items, 2, 10);
         assert_eq!(out.len(), 3);
         assert_eq!(out.iter().filter(|c| c.path == "a.rs").count(), 2);
+    }
+
+    /// 索引目录被别的进程占用（tantivy writer 排他锁）时，`--refresh` 不能把检索弄死：
+    /// 必须沿用现有索引返回结果，等下一次 refresh 再同步改动。
+    #[test]
+    fn 索引被占用时刷新不失败_沿用现有索引() {
+        let base = std::env::temp_dir().join(format!(
+            "relation-search-busy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let root = base.join("repo");
+        let index_dir = base.join("index");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("busy_probe.rs"),
+            "pub fn busy_probe_marker() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        index_root(&root, &index_dir).expect("首次建索引");
+
+        // 模拟「另一个进程正在写同一个索引目录」：拿到 writer 就等于占住锁。
+        let index = Index::open_in_dir(&index_dir).unwrap();
+        let writer: IndexWriter<TantivyDocument> =
+            index.writer(WRITER_MEMORY_BUDGET).expect("拿到 writer");
+        assert!(
+            index
+                .writer::<TantivyDocument>(WRITER_MEMORY_BUDGET)
+                .is_err(),
+            "同一索引目录的 writer 必须是排他锁（否则本用例没测到真冲突）"
+        );
+
+        let options = SearchOptions {
+            query: "busy_probe_marker".to_string(),
+            limit: 5,
+            refresh: true,
+            ..SearchOptions::default()
+        };
+        let out = search_root_with_options(&root, &index_dir, &options)
+            .expect("索引被占用也不该让检索失败");
+        assert!(out.count >= 1, "沿用现有索引应能检索到内容：{out:?}");
+
+        drop(writer);
+        let refreshed =
+            search_root_with_options(&root, &index_dir, &options).expect("锁释放后 refresh 正常");
+        assert!(refreshed.count >= 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

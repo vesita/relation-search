@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use relation_search::engine::{
-    DEFAULT_PER_FILE_CAP, Filter, IndexMode, SearchOptions, default_index_dir,
+    DEFAULT_PER_FILE_CAP, Filter, IndexMode, SearchOptions, default_index_dir, index_dir_busy,
     index_root_with_mode, search_root_with_options,
 };
 
@@ -90,7 +90,16 @@ fn run() -> Result<()> {
             } else {
                 IndexMode::Incremental
             };
-            let summary = index_root_with_mode(&root, &index_dir, mode)?;
+            let summary = index_root_with_mode(&root, &index_dir, mode).map_err(|error| {
+                if index_dir_busy(&error) {
+                    anyhow::anyhow!(
+                        "另一个进程正在写索引目录 {}：请等它结束再试（`search --refresh` 会自动沿用旧索引）",
+                        index_dir.display()
+                    )
+                } else {
+                    error
+                }
+            })?;
             // 成功：stdout 单行 JSON，字段名与插件契约一致。
             let json = serde_json::json!({
                 "ok": true,

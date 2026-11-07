@@ -29,6 +29,9 @@ relation-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n
   - `--no-kind-weight`：关闭上述 kind 权重，`score` 变回**原始 BM25**（文件类型不再影响排序）；适合通用文本 / 记忆类检索。
   - `--no-per-file-cap`：关闭「同一文件最多 2 块」截断，只按 `--limit` 截断。
   - `--refresh`：检索前先跑一次**增量 `index`**（只处理新增 / 修改 / 删除的文件），保证结果反映当前磁盘内容；不加该标志时行为不变（索引不存在时仍会自动建）。
+- 并发：同一 `--index-dir` 的 tantivy writer 是排他锁。`--refresh` / 自动建索引拿不到锁时（另一个
+  进程正在写同一个索引目录，插件多会话并发检索会遇到）**沿用现有索引继续检索**并在 stderr 提示；
+  锁释放后的下一次 `--refresh` 会把改动补上。`index --rebuild` 拿不到锁则明确报错（重建不能半途而废）。
 - `search` 的 `--refresh` 与 `index` 的增量更新共用同一套 manifest 判定：已有匹配 `INDEX_FORMAT_VERSION` 的清单时只处理变化文件；首次 / 版本不符仍自动全量重建。
 - **硬过滤（给了才生效，与上一条的"降权"不同：不满足即排除）**：`--kinds`（逗号分隔，只保留指定 kind：`code`/`test`/`doc`/`config`/`generated`/`other`）、`--include` / `--exclude`（路径 glob，逗号分隔，`*` 可跨目录，如 `*.rs` 命中所有 rust 文件）。未知 kind 直接报错。不给这些参数时行为与上一条完全一致。
 - `--query` 与建索引共用同一个代码分词器（camelCase / snake_case / CJK 切词，并叠加 `RemoveLong(64)` 超长过滤与 `AsciiFolding` 重音折叠）：切出的词项按 OR 召回、BM25 排序；词项整串相邻出现时（如完整标识符 `user_profile_cache`）再加一条短语子句加分，把精确命中排到更前。`:`、`(`、`[`、引号、开头的 `-` 等标点/符号**不当作查询语法**，`IndexWriter::commit`、`fn(x)`、`matches!(x, Some(_))`、`-verbose` 这类代码片段可直接搜、不会因语法错误整条失败。
