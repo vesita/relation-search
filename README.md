@@ -5,7 +5,10 @@
 
 ## 组成
 
-- **Rust 引擎**（`Cargo.toml` / `src/`）：tantivy 全文索引 + BM25 排序，代码感知分词（camelCase/snake_case 拆词 + 重音折叠 + 超长 token 过滤）+ jieba-rs 中文分词；内嵌 ast-grep 结构召回（无需外部工具）。
+- **Rust 引擎**（`Cargo.toml` / `src/`）：
+  - **PriorSeek (ps) RRF(60) 秩融合**：双路异构检索归一，词法与 AST 结构双命中时产生物理共振跃升；
+  - **PriorSeek 代码概念同义硬对齐**：支持缩写与全称互查（`cfg` ↔ `config`, `req` ↔ `request`, `ctx` ↔ `context`, `db` ↔ `database` 等）；
+  - tantivy 全文索引 + BM25 排序，代码感知分词（camelCase/snake_case 拆词 + 重音折叠 + 超长 token 过滤）+ jieba-rs 中文分词；内嵌 ast-grep 结构召回（无需外部工具）。
 - **dsh 插件**（`plugin/`）：把引擎包成一个 agent 可调用的 tool `relation_search`。
 
 ## CLI 契约（插件依赖，勿随意改）

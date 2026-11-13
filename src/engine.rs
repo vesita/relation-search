@@ -720,39 +720,52 @@ pub fn search_root_with_options(
     // 权重已并入 score；先按 score 降序（BM25 结果）。
     candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
 
-    // 可选：ast-grep 结构召回。与 BM25 做「去重 + 融合」而不是无脑 append：
-    // - 同一文件里与已有 BM25 候选行区间重叠的 AST 命中跳过（避免重复展示同一段代码）；
-    // - 其余 AST 命中给一个「略低于最弱 BM25 候选」的基础分（BM25 为空时给 0），
-    //   使其能进榜且排序稳定，但不会压过内容命中；最后统一 cap_per_file + 截断到 limit。
+    // 可选：ast-grep 结构召回。使用 PriorSeek (ps) 的无超参 RRF(60) 双路秩融合：
+    // - 将词法 BM25 序列与语法 AST 序列投射到倒数秩空间，消除量纲不可比问题；
+    // - 同一文件且行区间重叠的块视为双路命中，叠加两路倒数秩分数产生物理共振跃升；
+    // - 纯 BM25 获得 1/(60 + r_bm25)，纯 AST 获得 1/(60 + r_ast)，保持元数据与 source 语义 100% 完整。
     if let Some(pattern) = options.ast_pattern.as_deref() {
+        const RRF_K: f64 = 60.0;
         let ast = ast_candidates(&root_abs, pattern, limit, &compiled);
-        let base = candidates
-            .last()
-            .map(|c| c.candidate.score)
-            .filter(|s| *s > 0.0)
-            .map(|s| s * 0.5)
-            .unwrap_or(0.0);
-        let mut added = 0usize;
-        for mut a in ast {
-            let overlaps = candidates.iter().any(|c| {
-                c.candidate.path == a.path
+
+        // 1. 将现有的 BM25 候选转为 RRF 倒数秩分
+        for (rank, c) in candidates.iter_mut().enumerate() {
+            c.candidate.score = 1.0 / (RRF_K + (rank as f64) + 1.0);
+        }
+
+        // 2. 遍历 AST 候选，执行重叠共振或新增纯 AST 候选
+        for (r_ast, a) in ast.into_iter().enumerate() {
+            let ast_score = 1.0 / (RRF_K + (r_ast as f64) + 1.0);
+            let mut matched = false;
+
+            for c in candidates.iter_mut() {
+                if c.candidate.path == a.path
                     && ranges_overlap(
                         c.candidate.start_line,
                         c.candidate.end_line,
                         a.start_line,
                         a.end_line,
                     )
-            });
-            if overlaps {
-                continue;
+                {
+                    // 双路命中产生共振跃升！
+                    c.candidate.score += ast_score;
+                    matched = true;
+                    break;
+                }
             }
-            a.score = (base - (added as f64) * 1e-6).max(0.0);
-            candidates.push(PendingCandidate {
-                candidate: a,
-                content: None,
-            });
-            added += 1;
+
+            if !matched {
+                // 纯 AST 命中
+                let mut pure_ast = a;
+                pure_ast.score = ast_score;
+                candidates.push(PendingCandidate {
+                    candidate: pure_ast,
+                    content: None,
+                });
+            }
         }
+
+        // 3. 融合后统一按 RRF 综合得分降序排序
         candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
     }
 
