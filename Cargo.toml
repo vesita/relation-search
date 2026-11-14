@@ -1,6 +1,6 @@
 [package]
 name = "relation-search"
-version = "0.2.17"
+version = "0.2.18"
 edition = "2024"
 description = "代码检索：PriorSeek RRF 融合 + tantivy BM25 + 代码感知分词/概念别名 + 内嵌 ast-grep 结构召回"
 repository = "https://github.com/vesita/relation-search"
