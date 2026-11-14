@@ -1,11 +1,19 @@
-//! 查询构造：按与索引相同的分词管线切词，词项 OR 召回 + 整串短语加分 + PriorSeek 代码概念别名扩展。
+//! 查询构造：按与索引相同的分词管线切词，词项 OR 召回 + 整串短语加分 + PriorSeek 代码概念别名与双语映射扩展。
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
+use sl_engine::BilingualLexicon;
 use tantivy::query::{BooleanQuery, EmptyQuery, Occur, PhraseQuery, Query, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Term};
 
 use crate::tokenizer::tokenize_to_strings;
+
+/// 全局懒初始化的 PriorSeek 核心双语映射枢纽。
+fn bilingual_hub() -> &'static BilingualLexicon {
+    static HUB: OnceLock<BilingualLexicon> = OnceLock::new();
+    HUB.get_or_init(BilingualLexicon::core)
+}
 
 /// 代码概念同义词硬映射表（双向规范化互查）：
 /// 让常见缩写与全称互相召回，消解程序员在命名上的缩写鸿沟。
@@ -83,11 +91,27 @@ pub(super) fn build_query(content_f: Field, query: &str) -> Box<dyn Query> {
             terms.push(Term::from_field_text(content_f, token));
         }
 
-        // 引入 PriorSeek 概念硬对齐先验：针对常见代码缩写进行同义召回扩展
+        // 1. 引入 PriorSeek 概念硬对齐先验：针对常见代码缩写进行同义召回扩展
         if let Some(aliases) = get_aliases(&lower) {
             for &alias in aliases {
                 if seen.insert(alias.to_string()) {
                     alias_terms.push(Term::from_field_text(content_f, alias));
+                }
+            }
+        }
+
+        // 2. 引入 PriorSeek 中英双语映射枢纽：支持中文搜英文代码、英文搜中文注释
+        for mapped in bilingual_hub().map_auto(token) {
+            let m_lower = mapped.to_ascii_lowercase();
+            if seen.insert(m_lower.clone()) {
+                alias_terms.push(Term::from_field_text(content_f, &mapped));
+            }
+            // 联动：对映射出的英文词进一步触发缩写别名扩展
+            if let Some(aliases) = get_aliases(&m_lower) {
+                for &alias in aliases {
+                    if seen.insert(alias.to_string()) {
+                        alias_terms.push(Term::from_field_text(content_f, alias));
+                    }
                 }
             }
         }

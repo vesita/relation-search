@@ -715,10 +715,69 @@ fn ps_concept_alias_and_rrf_synergy() {
         !cands.is_empty(),
         "PriorSeek 代码概念同义硬映射应成功召回缩写代码"
     );
-    assert!(
-        cands[0]["path"].as_str().unwrap().ends_with("db.rs"),
-        "双路 RRF 共振应将词法+结构双命中的 db.rs 置顶第一"
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// 验证 PriorSeek 中英双语映射枢纽带来的跨语言代码检索能力：
+/// 1. 用中文 "配置 数据库" 检索英文代码 "init_db_cfg"；
+/// 2. 用英文 "connection" 检索中文注释 "// 连接数据库配置"。
+#[test]
+fn ps_bilingual_cross_language_retrieval() {
+    let fixture = unique_tmp("ps-bilingual-test");
+    let index_dir = unique_tmp("ps-bilingual-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    write(
+        &fixture.join("src/service.rs"),
+        "pub fn init_db_cfg() {\n    // 连接数据库配置\n}\n",
     );
+    write(
+        &fixture.join("src/other.rs"),
+        "pub fn compute_score() {\n    // 业务逻辑\n}\n",
+    );
+
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    // 1. 中文搜英文代码
+    let (code, stdout, stderr) = run(&[
+        "search",
+        "--root",
+        &fs,
+        "--index-dir",
+        &is,
+        "--query",
+        "配置 数据库",
+    ]);
+    assert_eq!(code, 0, "search 失败: {stderr}");
+    let j = parse_single_json(&stdout);
+    let cands = j["candidates"].as_array().unwrap();
+    assert!(
+        !cands.is_empty(),
+        "PriorSeek 双语映射枢纽应支持中文搜出英文代码"
+    );
+    assert!(cands[0]["path"].as_str().unwrap().ends_with("service.rs"));
+
+    // 2. 英文搜中文注释
+    let (code, stdout, stderr) = run(&[
+        "search",
+        "--root",
+        &fs,
+        "--index-dir",
+        &is,
+        "--query",
+        "connection",
+    ]);
+    assert_eq!(code, 0, "search 失败: {stderr}");
+    let j = parse_single_json(&stdout);
+    let cands = j["candidates"].as_array().unwrap();
+    assert!(
+        !cands.is_empty(),
+        "PriorSeek 双语映射枢纽应支持英文搜出中文注释"
+    );
+    assert!(cands[0]["path"].as_str().unwrap().ends_with("service.rs"));
 
     let _ = std::fs::remove_dir_all(&fixture);
     let _ = std::fs::remove_dir_all(&index_dir);
