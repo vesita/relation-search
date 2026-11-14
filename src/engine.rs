@@ -494,6 +494,15 @@ pub struct Candidate {
     pub source: String, // "bm25" 或 "ast"
     pub kind: String,   // "code" | "test" | "doc" | "config" | "generated" | "other"
     pub symbol: String, // 所在一处定义的签名（尽力而为，可能为空）
+    /// AST 节点语法类型（如 function_item / call_expression 等）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_kind: Option<String>,
+    /// AST 外层宿主作用域（如 ClassName::methodName / ImplType）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_scope: Option<String>,
+    /// AST 模式中捕获的元变量对应关系（如 $F => "method_name"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ast_env: Option<HashMap<String, String>>,
 }
 
 /// 候选池里的一项：`snippet` 延迟到「进入最终结果」时再生。
@@ -714,6 +723,9 @@ pub fn search_root_with_options(
                 end_line,
                 snippet: String::new(), // 池阶段不生成，最终候选才生成
                 source: "bm25".to_string(),
+                ast_kind: None,
+                ast_scope: None,
+                ast_env: None,
             },
             content: Some(content.to_string()),
         });
@@ -736,7 +748,7 @@ pub fn search_root_with_options(
             .with_k(60.0)
             .add_route("bm25", candidates)
             .add_route("ast", ast_pending)
-            .fuse_overlapping(
+            .fuse_overlapping_with_merge(
                 |c| c.candidate.path.clone(),
                 |a, b| {
                     ranges_overlap(
@@ -746,13 +758,35 @@ pub fn search_root_with_options(
                         b.candidate.end_line,
                     )
                 },
+                |existing, incoming| {
+                    // 发生空间/语法重叠共振时，忠实合并 AST 关系与元数据
+                    if incoming.candidate.ast_kind.is_some() {
+                        if existing.candidate.ast_kind.is_none() {
+                            existing.candidate.ast_kind = incoming.candidate.ast_kind.clone();
+                        }
+                        if existing.candidate.ast_scope.is_none() {
+                            existing.candidate.ast_scope = incoming.candidate.ast_scope.clone();
+                        }
+                        if existing.candidate.ast_env.is_none() {
+                            existing.candidate.ast_env = incoming.candidate.ast_env.clone();
+                        }
+                        if !incoming.candidate.symbol.is_empty() {
+                            existing.candidate.symbol = incoming.candidate.symbol.clone();
+                        }
+                    }
+                },
             );
 
         candidates = fused
             .into_iter()
             .map(|fi| {
+                let is_syn = fi.is_synergistic();
+                let score = fi.rrf_score;
                 let mut pending = fi.item;
-                pending.candidate.score = fi.rrf_score;
+                pending.candidate.score = score;
+                if is_syn {
+                    pending.candidate.source = "bm25+ast".to_string();
+                }
                 pending
             })
             .collect();
@@ -898,6 +932,9 @@ mod tests {
             source: "bm25".to_string(),
             kind: "code".to_string(),
             symbol: String::new(),
+            ast_kind: None,
+            ast_scope: None,
+            ast_env: None,
         }
     }
 

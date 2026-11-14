@@ -715,6 +715,27 @@ fn ps_concept_alias_and_rrf_synergy() {
         !cands.is_empty(),
         "PriorSeek 代码概念同义硬映射应成功召回缩写代码"
     );
+    assert_eq!(
+        cands[0]["source"],
+        "bm25+ast",
+        "双路 RRF 共振应将词法+结构双命中的候选项标记为 bm25+ast"
+    );
+    assert_eq!(
+        cands[0]["astKind"],
+        "function_item",
+        "应忠实反映 AST 语法节点类型"
+    );
+    assert_eq!(
+        cands[0]["symbol"],
+        "init_db_cfg",
+        "应忠实从 AST 读取函数名符号而非正则猜词"
+    );
+    assert_eq!(
+        cands[0]["astEnv"]["$F"],
+        "init_db_cfg",
+        "应忠实捕获元变量 $F 的 AST 具名绑定"
+    );
+
     let _ = std::fs::remove_dir_all(&fixture);
     let _ = std::fs::remove_dir_all(&index_dir);
 }
@@ -778,6 +799,50 @@ fn ps_bilingual_cross_language_retrieval() {
         "PriorSeek 双语映射枢纽应支持英文搜出中文注释"
     );
     assert!(cands[0]["path"].as_str().unwrap().ends_with("service.rs"));
+
+    let _ = std::fs::remove_dir_all(&fixture);
+    let _ = std::fs::remove_dir_all(&index_dir);
+}
+
+/// 验证忠实于 AST 关系的宿主作用域层级提取与 AST 语法容器包含
+#[test]
+fn test_faithful_ast_scope_and_containment() {
+    let fixture = unique_tmp("ps-ast-scope-test");
+    let index_dir = unique_tmp("ps-ast-scope-idx");
+    let fs = fixture.to_string_lossy().to_string();
+    let is = index_dir.to_string_lossy().to_string();
+
+    write(
+        &fixture.join("src/handler.rs"),
+        "impl OrderService {\n    pub fn checkout(&self, cart: Cart) -> Result<Order> {\n        // 结账结算流程\n        Ok(Order::new())\n    }\n}\n",
+    );
+
+    let (code, _, stderr) = run(&["index", "--root", &fs, "--index-dir", &is]);
+    assert_eq!(code, 0, "index 失败: {stderr}");
+
+    let (code, stdout, stderr) = run(&[
+        "search",
+        "--root",
+        &fs,
+        "--index-dir",
+        &is,
+        "--query",
+        "checkout",
+        "--ast-pattern",
+        "pub fn $METHOD($$$) -> Result<Order> { $$$ }",
+    ]);
+    assert_eq!(code, 0, "search 失败: {stderr}");
+    let j = parse_single_json(&stdout);
+    let cands = j["candidates"].as_array().unwrap();
+    assert!(!cands.is_empty());
+    let first = &cands[0];
+
+    // 验证 AST 关系元数据完整忠实呈现
+    assert_eq!(first["symbol"], "checkout");
+    assert_eq!(first["astKind"], "function_item");
+    assert_eq!(first["astScope"], "OrderService", "应忠实提取外层 impl OrderService 宿主作用域");
+    assert_eq!(first["astEnv"]["$METHOD"], "checkout", "应忠实捕获元变量 $METHOD");
+    assert_eq!(first["source"], "bm25+ast", "语法容器包含应触发 bm25+ast 共振");
 
     let _ = std::fs::remove_dir_all(&fixture);
     let _ = std::fs::remove_dir_all(&index_dir);
