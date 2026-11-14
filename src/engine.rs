@@ -501,6 +501,7 @@ pub struct Candidate {
 /// tantivy 的 `SnippetGenerator` 会重新分词整块正文；中文正文会触发 jieba 词典加载
 /// （约 60ms）并按篇切词。候选池默认 ≥40 篇，若在池阶段逐篇生成，纯 ASCII 查询也会
 /// 被拖进 jieba，实测 4ms → 70ms。故池阶段只保留正文，最终 top-limit 时才生成。
+#[derive(Clone)]
 struct PendingCandidate {
     candidate: Candidate,
     /// 待补 snippet 的块正文；AST 命中自带 snippet，这里为 None。
@@ -720,53 +721,41 @@ pub fn search_root_with_options(
     // 权重已并入 score；先按 score 降序（BM25 结果）。
     candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
 
-    // 可选：ast-grep 结构召回。使用 PriorSeek (ps) 的无超参 RRF(60) 双路秩融合：
-    // - 将词法 BM25 序列与语法 AST 序列投射到倒数秩空间，消除量纲不可比问题；
-    // - 同一文件且行区间重叠的块视为双路命中，叠加两路倒数秩分数产生物理共振跃升；
-    // - 纯 BM25 获得 1/(60 + r_bm25)，纯 AST 获得 1/(60 + r_ast)，保持元数据与 source 语义 100% 完整。
+    // 可选：ast-grep 结构召回。使用 PriorSeek (ps) 的无超参 RRF 泛型重叠共振管道：
     if let Some(pattern) = options.ast_pattern.as_deref() {
-        const RRF_K: f64 = 60.0;
         let ast = ast_candidates(&root_abs, pattern, limit, &compiled);
+        let ast_pending: Vec<PendingCandidate> = ast
+            .into_iter()
+            .map(|a| PendingCandidate {
+                candidate: a,
+                content: None,
+            })
+            .collect();
 
-        // 1. 将现有的 BM25 候选转为 RRF 倒数秩分
-        for (rank, c) in candidates.iter_mut().enumerate() {
-            c.candidate.score = 1.0 / (RRF_K + (rank as f64) + 1.0);
-        }
-
-        // 2. 遍历 AST 候选，执行重叠共振或新增纯 AST 候选
-        for (r_ast, a) in ast.into_iter().enumerate() {
-            let ast_score = 1.0 / (RRF_K + (r_ast as f64) + 1.0);
-            let mut matched = false;
-
-            for c in candidates.iter_mut() {
-                if c.candidate.path == a.path
-                    && ranges_overlap(
-                        c.candidate.start_line,
-                        c.candidate.end_line,
-                        a.start_line,
-                        a.end_line,
+        let fused = sl_bridge::RrfPipeline::new()
+            .with_k(60.0)
+            .add_route("bm25", candidates)
+            .add_route("ast", ast_pending)
+            .fuse_overlapping(
+                |c| c.candidate.path.clone(),
+                |a, b| {
+                    ranges_overlap(
+                        a.candidate.start_line,
+                        a.candidate.end_line,
+                        b.candidate.start_line,
+                        b.candidate.end_line,
                     )
-                {
-                    // 双路命中产生共振跃升！
-                    c.candidate.score += ast_score;
-                    matched = true;
-                    break;
-                }
-            }
+                },
+            );
 
-            if !matched {
-                // 纯 AST 命中
-                let mut pure_ast = a;
-                pure_ast.score = ast_score;
-                candidates.push(PendingCandidate {
-                    candidate: pure_ast,
-                    content: None,
-                });
-            }
-        }
-
-        // 3. 融合后统一按 RRF 综合得分降序排序
-        candidates.sort_by(|a, b| b.candidate.score.total_cmp(&a.candidate.score));
+        candidates = fused
+            .into_iter()
+            .map(|fi| {
+                let mut pending = fi.item;
+                pending.candidate.score = fi.rrf_score;
+                pending
+            })
+            .collect();
     }
 
     let mut candidates = match options.per_file_cap {

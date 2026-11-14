@@ -1236,6 +1236,7 @@ dependencies = [
  "jieba-rs",
  "serde",
  "serde_json",
+ "sl-bridge",
  "sl-core",
  "sl-engine",
  "tantivy",
@@ -1360,6 +1361,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e53e2f8d4e9c692f23a90208fad6a64862f413e286d533f1f649f160e2d5caee"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "sl-bridge"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "sl-core",
+ "sl-engine",
 ]
 
 [[package]]
