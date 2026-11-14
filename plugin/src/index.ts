@@ -204,6 +204,10 @@ export function apply(ctx: any): void {
                 snippet: { type: 'string' },
                 kind: { type: 'string', required: true },
                 symbol: { type: 'string', required: true },
+                // 引擎 0.2.17 起随 AST 命中返回的语法关系元数据（BM25 命中没有这三项）。
+                astKind: { type: 'string' },
+                astScope: { type: 'string' },
+                astEnv: { type: 'object', additionalProperties: true },
               },
             },
           },

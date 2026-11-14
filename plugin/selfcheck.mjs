@@ -35,8 +35,13 @@ const astValue = await tool.execute(
   { query: 'zzz_nomatch_zzz', root, astPattern: 'def $F($$$): $$$' },
   { agent: {}, signal: undefined },
 )
-assert.ok(
-  astValue.candidates.some((c) => c.source === 'ast' && String(c.path).includes('profile.py')),
-  'ast 结构召回应命中 app/profile.py',
+const astHit = astValue.candidates.find(
+  (c) => c.source === 'ast' && String(c.path).includes('profile.py'),
 )
+assert.ok(astHit, 'ast 结构召回应命中 app/profile.py')
+// 0.2.17 起 AST 命中带语法关系元数据；插件 output schema 必须容纳它们，
+// 否则 additionalProperties:false 会让整次工具调用失败。
+assert.equal(typeof astHit.astKind, 'string', 'ast 命中应带 astKind')
+assert.equal(typeof astHit.astEnv, 'object', 'ast 命中应带 astEnv')
+assert.ok('$F' in astHit.astEnv, 'astEnv 应捕获 pattern 元变量 $F 的绑定')
 console.log('OK: 插件注册成功，BM25 与内嵌 ast 结构召回均返回候选')

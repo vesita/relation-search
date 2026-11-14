@@ -23,10 +23,12 @@ relation-search search --root <path> [--index-dir <dir>] --query <q> [--limit <n
 - `search` 成功向 stdout 打印 JSON：
   ```json
   {"query":"...","root":"...","documents":264,"count":2,"candidates":[
-    {"path":"rel/file.rs","startLine":10,"endLine":28,"score":12.3,"snippet":"...","source":"bm25","kind":"code","symbol":"fn user_profile_cache"}
+    {"path":"rel/file.rs","startLine":10,"endLine":28,"score":12.3,"snippet":"...","source":"bm25","kind":"code","symbol":"fn user_profile_cache"},
+    {"path":"rel/order.rs","startLine":3,"endLine":9,"score":0.0328,"snippet":"...","source":"bm25+ast","kind":"code","symbol":"checkout","astKind":"function_item","astScope":"OrderService","astEnv":{"$METHOD":"checkout"}}
   ]}
   ```
-  `source` 取 `bm25` 或 `ast`；`documents` 是索引内当前块总数（扫描面）；无命中时 `count:0,"candidates":[]`，退出码 0。
+  `source` 取 `bm25` / `ast` / `bm25+ast`（同一块被词法与 AST 双路命中，RRF 共振）；`documents` 是索引内当前块总数（扫描面）；无命中时 `count:0,"candidates":[]`，退出码 0。
+- AST 命中额外带三个**语法关系字段**（BM25 命中没有）：`astKind`（tree-sitter 节点类型）、`astScope`（沿祖先树回溯的外层作用域，`Impl`/`Class`/外层函数，`::` 连接）、`astEnv`（pattern 里 `$VAR` / `$$$VARS` 的具名绑定）。`symbol` 在 AST 命中时优先取语法树的 `name`/`type` 字段，比正则猜词更准。
 - `--summary`：只回扫描摘要——`candidates` 不带 `snippet`（引擎也跳过片段生成），并带回 `documents`（索引块总数）。用于「先扫一遍命中面，再决定细看哪条」，配合 `--limit` 可低成本扩大扫描范围。
   `kind` 取 `code` / `test` / `doc` / `config` / `generated` / `other`；`symbol` 是块内首个定义签名（`fn foo` / `struct Bar` …，尽力而为，取不到为空串）。
 - `search` 默认**代码优先**：文件类型权重（`code` 1.0 / `test` 0.85 / `doc` 0.30 / `config` 0.35 / `generated` 0.15 / 其它 0.60）在 BM25 **收集阶段**并入打分（`TopDocs::tweak_score`），并对**同一文件最多保留 2 块**——避免文档/配置或单个大文件把候选位占满。返回的 `score` 是加权后的最终排序分。
